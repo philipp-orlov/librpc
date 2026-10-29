@@ -1,0 +1,49 @@
+/// librpc wire protocol (sub-protocol "librpc.v1").
+///
+/// Every WebSocket message is a binary frame of whole libbufs messages laid end to end, each 8-aligned:
+///
+///   client -> server   Envelope [, request message]      (Hello, Call, Cancel, Credit, Ping, Goodbye)
+///   server -> client   Envelope [, response message]     (Welcome, Data, End, Pong, Closing)
+///
+/// The message after the envelope is the method's own request or response table, so a call's payload is read in
+/// place on the other side and never wrapped, copied into a byte vector or re-encoded.
+///
+/// Every default here is zero: a field that is missing, or a message from an older writer, reads as zero,
+/// and a reader in any language that ignores the XOR libbufs applies to scalars still agrees. Keep it so.
+namespace rpc.wire;
+
+enum Kind : ubyte {
+    None,
+    Hello,      // client: first frame. protocol, peer, token, window, max_message
+    Welcome,    // server: answer to Hello. protocol, peer, session, window, max_message, max_inflight
+    Call,       // client: start call `id` of `method`; the request message follows; deadline_ms
+    Data,       // server: one item of the server stream of call `id`; the response message follows
+    End,        // server: call `id` is over. code, message. A unary call's response message follows an OK End
+    Cancel,     // client: abandon call `id`
+    Credit,     // client: `credit` more bytes of Data frames have been consumed (flow control)
+    Ping,       // either way; answered by Pong with the same `id`
+    Pong,
+    Goodbye,    // client: finish what is running, then close
+    Closing     // server: shutting down; no new calls are accepted
+}
+
+table Envelope {
+    id:uint;            // the call (chosen by the client, never 0 for a call); echoed by every frame of that call
+    kind:Kind = None;
+    method:uint;        // Call: FNV-1a (32 bit) of "namespace.Service.Method" (see rpc::methodId)
+    code:ushort;        // End: rpc::Code
+    message:string;     // End: the status message
+    deadline_ms:uint;   // Call: how long the server may take; 0 = no deadline
+    // Hello / Welcome
+    protocol:ushort;    // 1
+    peer:string;        // "librpc/0.1 C++", "librpc-ts/0.1"
+    token:string;       // Hello: credentials, when the handshake could not carry them
+    window:ulong;       // bytes of stream Data the sender of this frame accepts before it must send Credit
+    max_message:uint;   // largest WebSocket message the sender accepts
+    session:ulong;      // Welcome
+    max_inflight:uint;  // Welcome: calls the client may have running at once
+    credit:ulong;       // Credit
+    detail:uint;        // End: application-defined detail of the status (libsql: ErrorCode << 8 | Constraint); 0 = none
+}
+
+root_type Envelope;

@@ -1,0 +1,16 @@
+# Generates the C# for the example schemas, then builds and runs cs/Librpc.Tests against the interop server.
+#   cmake -DRPCC=… -DSERVER=… -DDOTNET=… -DSOURCE=<librpc dir> -P csharp.cmake
+set(ENV{DOTNET_CLI_TELEMETRY_OPTOUT} 1)
+set(ENV{DOTNET_NOLOGO} 1)
+set(ENV{DOTNET_SYSTEM_GLOBALIZATION_INVARIANT} 1)
+set(tests ${SOURCE}/cs/Librpc.Tests)
+foreach(schema ${SOURCE}/examples/calc.bufs ${SOURCE}/tests/kitchen.bufs)
+    execute_process(COMMAND ${RPCC} --no-cpp --cs -o ${tests}/gen ${schema} RESULT_VARIABLE rc)
+    if(rc)
+        message(FATAL_ERROR "rpcc --cs failed on ${schema}")
+    endif()
+endforeach()
+execute_process(COMMAND ${DOTNET} run --project ${tests} -- ${SERVER} RESULT_VARIABLE rc)
+if(rc)
+    message(FATAL_ERROR "C# tests failed")
+endif()

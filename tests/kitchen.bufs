@@ -1,0 +1,80 @@
+/// Every kind of field, to prove that the C++ and TypeScript codecs agree byte for byte, defaults included.
+namespace test;
+
+enum Color : short { Red = 1, Green = 5, Blue = -2 }
+
+struct Vec {
+    x:float;
+    y:float;
+    z:float;
+    tag:[ubyte:3];
+    flag:bool;
+    big:long;
+}
+
+table Inner {
+    n:int = 7;
+    s:string;
+}
+
+table Kitchen {
+    tag:uint;                  // 0: the reference values, 1: all defaults (what Check expects)
+    b:bool;
+    bt:bool = true;
+    i8:byte = -3;
+    u8:ubyte = 200;
+    i16:short = -1000;
+    u16:ushort = 65000;
+    i32:int = -123456;
+    u32:uint = 4000000000;
+    i64:long = -9007199254740993;
+    u64:ulong = 18446744073709551615;
+    f32:float = 1.5;
+    f64:double = -2.25;
+    color:Color = Green;
+    text:string;
+    vec:Vec;
+    inner:Inner;
+    bytes:[ubyte];
+    i8s:[byte];
+    ints:[int];
+    longs:[long];
+    doubles:[double];
+    bools:[bool];
+    names:[string];
+    colors:[Color];
+    inners:[Inner];
+    vecs:[Vec];
+    late:int = 99;
+}
+
+table Pick { which:uint; }
+table Verdict { ok:bool; message:string; }
+
+rpc_service Kitchens {
+    /// Which 0: the reference Kitchen; 1: an empty one (all defaults).
+    Canned(Pick):Kitchen;
+    /// Compares the Kitchen with what its `tag` says it should be.
+    Check(Kitchen):Verdict;
+}
+
+/// The same kinds of values as method parameters and results (the natural form).
+rpc_service Natural {
+    /// A summary of every parameter, as text: the format is in kitchen_service.hpp / interop.test.ts.
+    Describe(b: bool, big: long, f: float, c: Color, s: string, v: Vec, nums: [int], names: [string], flags: [bool],
+             vecs: [Vec], inner: Inner, d: double = 2.5): string;
+    Squares(n: uint): [long];
+    Words(): [string];
+    Flip(b: bool): bool;
+    Origin(): Vec;
+    Make(name: string): Inner;
+    Countdown(from: int): stream string;
+    Colors(): stream Color;
+    Nothing(): void;
+    /// n Inner items, then a Verdict as the stream's trailer.
+    Tally(n: uint): stream Inner (trailer: "Verdict");
+    /// Fails with the given application detail.
+    Fail(detail: uint): void;
+    /// Blocks until the call is cancelled -- woken by ServerContext::onCancel, not by polling.
+    Hang(): uint;
+}

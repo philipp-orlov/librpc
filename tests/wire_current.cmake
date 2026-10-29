@@ -1,0 +1,15 @@
+# Regenerates the wire codec of one language and compares it with the checked-in copy.
+#   -DRPCC -DSCHEMA -DCHECKED_IN -DWORK -DFLAGS="--ts;--ts-runtime;./bufs" -DPRODUCED=rpc.bufs.ts
+file(MAKE_DIRECTORY ${WORK})
+if(NOT FLAGS)
+    set(FLAGS "--ts;--ts-runtime;./bufs")
+    set(PRODUCED rpc.bufs.ts)
+endif()
+execute_process(COMMAND ${RPCC} -o ${WORK} --no-cpp ${FLAGS} ${SCHEMA} RESULT_VARIABLE status)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "rpcc failed")
+endif()
+execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files ${WORK}/${PRODUCED} ${CHECKED_IN} RESULT_VARIABLE same)
+if(NOT same EQUAL 0)
+    message(FATAL_ERROR "${CHECKED_IN} is stale: run  rpcc -o <its directory> --no-cpp ${FLAGS} ${SCHEMA}")
+endif()

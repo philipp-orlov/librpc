@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>librpc calc</title>
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 2rem auto; max-width: 32rem; padding: 0 1rem; }
+  input, select, button { font: inherit; padding: .3rem .5rem; }
+  input { width: 6rem; }
+  pre { background: #f4f4f4; padding: .75rem; min-height: 8rem; overflow: auto; }
+</style>
+<h1>librpc calc</h1>
+<p>
+  <input id="a" type="number" value="6">
+  <select id="op"><option value="+" selected>+</option><option value="-">-</option><option value="/">÷</option></select>
+  <input id="b" type="number" value="7">
+  <button id="compute">Compute</button>
+</p>
+<p><button id="count">Stream 1..10</button></p>
+<pre id="log"></pre>
+<script type="module" src="bundle.js"></script>

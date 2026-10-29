@@ -1,0 +1,4 @@
+bin/
+obj/
+# written by tests/csharp.cmake from the example schemas
+Librpc.Tests/gen/
