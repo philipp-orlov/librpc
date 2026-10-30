@@ -984,8 +984,14 @@ private:
                 flushReleases();  // about to wait: tell the client what it can reuse
                 lock.lock();
             }
-            cv_.wait(lock, [&] { return call.inCount != 0 || call.inClosed || call.cancelled.load() || closed(); });
-            if (call.cancelled.load() || closed() || call.inCount == 0)
+            const auto ready = [&] { return call.inCount != 0 || call.inClosed || call.cancelled.load() || closed(); };
+            // A finite deadline bounds the wait; runCall turns the false returned here into DeadlineExceeded. An
+            // infinite one is a plain wait (a time_point::max() wait_until can overflow the clock).
+            if (call.deadline == Clock::time_point::max())
+                cv_.wait(lock, ready);
+            else
+                cv_.wait_until(lock, call.deadline, ready);
+            if (call.cancelled.load() || closed() || call.inCount == 0 || Clock::now() >= call.deadline)
                 return false;
             ServerCall::InItem item = call.popItem();
             call.inBytes -= item.frameBytes;

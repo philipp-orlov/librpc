@@ -15,6 +15,8 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -1105,6 +1107,35 @@ void testBlobsLeases() {
     g_local = before;
 }
 
+// A server-side stream read honors the deadline the client sent, with nothing arriving and no cancel following.
+void testIdleStreamReadHonorsDeadline() {
+    std::puts("deadlines: idle stream reads");
+    const bool before = g_local;
+    for (const bool local : {false, true}) {
+    g_local = local;
+    TestServer server;
+    rpc::Client client = server.connect();
+    test::BlobsClient blobs(client);
+    {
+        auto up = blobs.Upload(rpc::CallOptions{50ms});
+        CHECK(server.waitFor("test.Blobs.Upload", rpc::Code::DeadlineExceeded, 300ms));
+    }
+    {
+        auto echo = blobs.Echo(rpc::CallOptions{50ms});
+        CHECK(server.waitFor("test.Blobs.Echo", rpc::Code::DeadlineExceeded, 300ms));
+    }
+    // the worker is free again
+    CHECK(blobs.Scan(rpc::Span<const uint8_t>(), 0)->result() == "0:0:0:0");
+    // a stream that fits its deadline is not cut short
+    {
+        auto up = blobs.Upload(rpc::CallOptions{5s});
+        CHECK(up.write([&](test::Frame::Builder& p) { p.setSequence(7); }));
+        CHECK(up.finish()->result().rfind("7=", 0) == 0);
+    }
+    }
+    g_local = before;
+}
+
 // A 25 MB blob through rings a fraction of its size.
 void testBlobsLarge() {
     std::puts("shared blobs: far larger than the ring");
@@ -1593,6 +1624,7 @@ int main(int argc, char** argv) {
     testBlobsExhaustion();
     testBlobsLeases();
     testBlobsLarge();
+    testIdleStreamReadHonorsDeadline();
     testBlobsValidation();
     testBlobsHandshake();
     testBlobsRegistration();
