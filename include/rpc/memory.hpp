@@ -60,13 +60,36 @@ struct InboundMemory {
 /// unified; on Tegra it may differ). PinnedPool remembers it per block: device() translates.
 ///
 /// The pool must outlive every message received through it.
+///
+/// Unbounded by default, and then it retains the high-water mark of every size class for its whole life. Limits bound
+/// that, and neither touches a block that is out:
+///   maxBytes      registered bytes (idle and out together). A request that would pass it is refused (nullptr), so
+///                 that frame falls back to librpc's own pool, unregistered.
+///   maxIdleBytes  bytes kept registered for reuse; a block released beyond it is unregistered and freed at once,
+///                 largest classes first. trim() does the same on demand.
+/// The shared arenas (EndpointOptions::sharedArena*) are budgeted separately: this pool is not part of them.
 class PinnedPool {
 public:
+    struct Limits {
+        size_t maxBytes = 0;      // 0 = none
+        size_t maxIdleBytes = 0;  // 0 = none
+    };
+    struct Stats {
+        size_t blocks = 0;          // registered blocks
+        size_t bytes = 0;           // their total size
+        size_t inUseBlocks = 0;     // out right now
+        size_t idleBytes = 0;       // registered and waiting for reuse
+        size_t peakBytes = 0;       // the most registered at once
+        uint64_t refusals = 0;      // requests refused by maxBytes (they fell back to the library's pool)
+        uint64_t evictedBlocks = 0; // idle blocks unregistered by maxIdleBytes or trim()
+    };
+
     PinnedPool() = default;
     /// A non-null result of registerMemory is the block's device address; nullptr = it could not be registered (that
     /// frame falls back to librpc's own pool). unregisterMemory is called for every registered block when the pool
     /// is destroyed.
     explicit PinnedPool(DeviceRegistration registration);
+    PinnedPool(DeviceRegistration registration, Limits limits);
     ~PinnedPool();
     PinnedPool(const PinnedPool&) = delete;
     PinnedPool& operator=(const PinnedPool&) = delete;
@@ -82,6 +105,10 @@ public:
     size_t blocks() const;
     size_t bytes() const;
     size_t inUse() const noexcept { return inUse_.load(std::memory_order_relaxed); }
+    Stats stats() const;
+    /// Unregisters and frees idle blocks, largest first, until at most `keepIdleBytes` of them remain. Returns the
+    /// bytes freed. Blocks that are out are never touched.
+    size_t trim(size_t keepIdleBytes = 0);
 
 private:
     static constexpr size_t kMinShift = 12;  // 4 KiB
@@ -95,12 +122,22 @@ private:
 
     void* take(size_t bytes);
     void give(void* data, size_t bytes);
+    // Detaches idle blocks past `keep` bytes (under the lock held by the caller); retire() runs outside it.
+    void evictLocked(size_t keep, std::vector<BlockInfo>& out);
+    void retire(const std::vector<BlockInfo>& blocks);
 
     DeviceRegistration registration_;
+    Limits limits_;
     mutable std::mutex mutex_;
     std::vector<void*> free_[kClasses];
     std::vector<BlockInfo> all_;  // every block, sorted by host address (grows only when the pool does)
     std::atomic<size_t> inUse_{0};
+    size_t registeredBytes_ = 0;  // all_, in bytes
+    size_t reservedBytes_ = 0;    // being created right now, outside the lock
+    size_t idleBytes_ = 0;
+    size_t peakBytes_ = 0;
+    uint64_t refusals_ = 0;
+    uint64_t evicted_ = 0;
 };
 
 } // namespace rpc

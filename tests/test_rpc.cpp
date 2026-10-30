@@ -274,6 +274,103 @@ struct PinCount {
     std::atomic<int> registered{0}, unregistered{0};
 };
 
+// PinnedPool limits: a registration budget, a bound on what idle blocks keep, and exactly-once unregistration.
+void testPinnedPoolLimits() {
+    std::puts("pinned pool: budgets");
+    struct Pins {
+        std::mutex mutex;
+        std::set<void*> live;
+        std::atomic<int> registered{0}, unregistered{0}, doubled{0};
+        std::atomic<bool> failNext{false};
+    } pins;
+    const rpc::DeviceRegistration registration{
+        [](void* ctx, void* p, size_t) -> void* {
+            auto* pins = static_cast<Pins*>(ctx);
+            if (pins->failNext.exchange(false))
+                return nullptr;
+            std::lock_guard<std::mutex> lock(pins->mutex);
+            pins->live.insert(p);
+            pins->registered++;
+            return static_cast<uint8_t*>(p) + 1;
+        },
+        [](void* ctx, void* p, size_t) {
+            auto* pins = static_cast<Pins*>(ctx);
+            std::lock_guard<std::mutex> lock(pins->mutex);
+            if (!pins->live.erase(p))
+                pins->doubled++;
+            pins->unregistered++;
+        },
+        &pins};
+    constexpr size_t kMiB = 1 << 20;
+    {
+        rpc::PinnedPool pool(registration, {/*maxBytes=*/3 * kMiB, /*maxIdleBytes=*/2 * kMiB});
+        const rpc::InboundMemory memory = pool.memory();
+        auto* a = static_cast<uint8_t*>(memory.allocate(memory.ctx, kMiB));
+        auto* b = static_cast<uint8_t*>(memory.allocate(memory.ctx, kMiB));
+        auto* c = static_cast<uint8_t*>(memory.allocate(memory.ctx, kMiB));
+        CHECK(a && b && c);
+        // the budget is spent: refused, not registered, and the pool is unharmed
+        CHECK(memory.allocate(memory.ctx, 4096) == nullptr);
+        CHECK(pool.stats().refusals == 1 && pool.bytes() == 3 * kMiB);
+        // a refused registration gives its reservation back
+        memory.release(memory.ctx, c, kMiB);  // idle: 1 MiB, within maxIdleBytes
+        pins.failNext = true;
+        CHECK(memory.allocate(memory.ctx, 2 * kMiB) == nullptr);  // would need 5 MiB of 3 anyway
+        CHECK(pool.stats().refusals == 2);
+        // idle past the bound: the larger blocks are unregistered at once, and out blocks are never touched
+        memory.release(memory.ctx, a, kMiB);
+        memory.release(memory.ctx, b, kMiB);
+        const auto stats = pool.stats();
+        CHECK(stats.idleBytes <= 2 * kMiB && stats.evictedBlocks == 1 && stats.blocks == 2);
+        CHECK(pool.device(a + 8) == a + 9 || pool.device(b + 8) == b + 9 || pool.device(c + 8) == c + 9);
+        CHECK(pins.unregistered == 1);
+        // a failed registration does not leak its reservation
+        auto* held = static_cast<uint8_t*>(memory.allocate(memory.ctx, kMiB));
+        CHECK(held);
+        pins.failNext = true;
+        CHECK(memory.allocate(memory.ctx, 3 * kMiB / 2) == nullptr);  // 2 MiB class: over the budget, refused
+        pins.failNext = true;
+        CHECK(memory.allocate(memory.ctx, 8192) == nullptr);  // registration fails
+        auto* small = static_cast<uint8_t*>(memory.allocate(memory.ctx, 8192));
+        CHECK(small);  // and the budget still has room for it
+        memory.release(memory.ctx, small, 8192);
+        // trim() on demand; the block that is out stays
+        CHECK(pool.trim(0) > 0);
+        CHECK(pool.stats().idleBytes == 0 && pool.stats().inUseBlocks == 1);
+        CHECK(pool.device(held + 8) == held + 9);
+        memory.release(memory.ctx, held, kMiB);
+        CHECK(pool.stats().peakBytes == 3 * kMiB);
+    }
+    CHECK(pins.live.empty() && pins.doubled == 0 && pins.registered == pins.unregistered);
+
+    // concurrent use: the budget holds at every instant and every registration is undone exactly once
+    pins.registered = pins.unregistered = 0;
+    {
+        rpc::PinnedPool pool(registration, {/*maxBytes=*/8 * kMiB, /*maxIdleBytes=*/kMiB});
+        const rpc::InboundMemory memory = pool.memory();
+        std::atomic<bool> over{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 6; ++t)
+            threads.emplace_back([&, t] {
+                for (int i = 0; i < 400; ++i) {
+                    const size_t bytes = size_t{4096} << ((i + t) % 8);
+                    void* p = memory.allocate(memory.ctx, bytes);
+                    if (pool.bytes() > 8 * kMiB)
+                        over = true;
+                    if (p) {
+                        static_cast<uint8_t*>(p)[0] = 1;
+                        memory.release(memory.ctx, p, bytes);
+                    }
+                }
+            });
+        for (std::thread& t : threads)
+            t.join();
+        CHECK(!over.load());
+        CHECK(pool.inUse() == 0 && pool.stats().idleBytes <= kMiB);
+    }
+    CHECK(pins.live.empty() && pins.doubled == 0 && pins.registered == pins.unregistered);
+}
+
 void testInboundMemory() {
     std::puts("received frames in caller-supplied memory");
     // The pools outlive the server and client: they must outlive every message.
@@ -1708,6 +1805,7 @@ int main(int argc, char** argv) {
     testBlobsExhaustion();
     testBlobsLeases();
     testBlobsLarge();
+    testPinnedPoolLimits();
     testIdleStreamReadHonorsDeadline();
     testArenaReusesAcrossSizeClasses();
     testTakenOutlivesTheEndpoint();
