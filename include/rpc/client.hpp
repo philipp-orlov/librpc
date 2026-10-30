@@ -25,6 +25,8 @@
 #include <vector>
 
 #include "bufs/bufs.hpp"
+#include "rpc/detail/block.hpp"
+#include "rpc/memory.hpp"
 #include "rpc/span.hpp"
 #include "rpc/status.hpp"
 
@@ -40,7 +42,7 @@ struct CallState;
 class Payload {
 public:
     Payload() = default;
-    Payload(bufs::Buffer buffer, size_t offset, size_t size) : buffer_(std::move(buffer)), offset_(offset), size_(size) {}
+    Payload(detail::Block buffer, size_t offset, size_t size) : buffer_(std::move(buffer)), offset_(offset), size_(size) {}
 
     /// 8-aligned.
     const uint8_t* data() const { return buffer_.data() + offset_; }
@@ -52,7 +54,7 @@ public:
     }
 
 private:
-    bufs::Buffer buffer_;
+    detail::Block buffer_;
     size_t offset_ = 0;
     size_t size_ = 0;
 };
@@ -73,6 +75,9 @@ struct ClientOptions {
     std::chrono::milliseconds pingInterval{15000};
     /// Bytes of stream items the server may send before we have consumed some. The server may choose less.
     size_t window = 1 << 20;
+    /// Where received messages land (see rpc/memory.hpp): the one copy out of the socket or ring can go straight
+    /// into memory a GPU can read. Default: librpc's own pool. Must outlive every Payload received.
+    InboundMemory inboundMemory;
     /// Largest WebSocket message we accept; the server may choose less.
     size_t maxMessage = 16 << 20;
     /// wss:// : the file with the CA certificates to trust (empty = the system's), and the test-only escape.

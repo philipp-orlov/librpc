@@ -318,6 +318,35 @@ over a stream, or a deadline sends `Cancel`. Method names are `snake_case`; a ta
 What does allocate: a status that carries a message (errors), the first use of a connection or a call slot, and
 whatever application code does.
 
+### Caller-supplied memory for received frames (GPU-visible buffers)
+
+Header `include/rpc/memory.hpp`; implementation `src/memory.cpp` (`PinnedPool`), `include/rpc/detail/block.hpp` (`Block`,
+`copyInbound`). Tests: `testInboundMemory` in `tests/test_rpc.cpp`, over both transports.
+
+A GPU cannot read librpc's pooled blocks or its shared-memory rings. Every received frame (the envelope followed by the
+message) is already copied once -- socket or ring into a block -- so the hook is to let the caller choose *where that one
+copy lands*; a consumer then reads the message in GPU-visible memory with no second copy. Two ways:
+
+1. **Callbacks.** `rpc::InboundMemory{allocate, release, ctx}` (plain function pointers, so the default path stays
+   allocation-free). `allocate(ctx, bytes)` returns >= `bytes` bytes, 8-aligned (nullptr or an exception = use librpc's own pool
+   for that frame); `release(ctx, data, bytes)` is called from whatever thread drops the last reference (a handler returning,
+   a `Payload` destroyed, a stream item read), possibly after the client/endpoint is gone. Both are called concurrently from
+   I/O threads. This is the way to assign per device, per stream or per NUMA node.
+2. **Registration.** `rpc::PinnedPool` is a grow-only pool of page-aligned blocks (power-of-two classes from 4 KiB) that calls
+   `Registration::registerMemory` once when a block is created and `unregisterMemory` at destruction -- wire these to
+   `cudaHostRegister` / `cudaHostUnregister`. Freed blocks go to a free list and are reused, so the steady state has no
+   allocation, no registration and no fragmentation. librpc itself has no CUDA dependency. Use `pool.memory()` to get the
+   `InboundMemory`.
+
+Where to set it: `EndpointOptions::inboundMemory(mem)` (server: requests and client stream items, WebSocket and local) and
+`ClientOptions::inboundMemory` (client: responses and stream items, WebSocket and local). The memory (and the pool) must
+outlive every message received through it. Not covered: the TypeScript, C# and Python clients; outgoing frames and a
+handler's trailer (still librpc's pool).
+
+What this deliberately is not: true zero-copy. A local connection's ring is shared with another process that may change it
+under us, so frames are copied out of it before being parsed; the ring is never handed out, and registering it with CUDA
+would not make reading it safe. The copy goes straight into the caller's memory instead.
+
 ## 11. libsql on librpc
 
 libsql's remote layer (`SqlSocket`, `Database::connect`, the `sql` tool's web interface) is a librpc service, `Sql`, written

@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "bufs/bufs.hpp"
+#include "rpc/memory.hpp"
 #include "http/server.hpp"
 #include "rpc/span.hpp"
 #include "rpc/status.hpp"
@@ -364,6 +365,13 @@ public:
         window_ = bytes;
         return *this;
     }
+    /// Where received frames (requests, stream items) land; see rpc/memory.hpp. The one copy out of the socket or
+    /// ring can go straight into memory a GPU can read, e.g. a PinnedPool registered with CUDA. Default: librpc's own
+    /// pool. The memory must outlive the endpoint and every message handed to a handler.
+    EndpointOptions& inboundMemory(InboundMemory memory) {
+        inboundMemory_ = memory;
+        return *this;
+    }
     /// Largest WebSocket message either way; 0 = the http::Server's maxWebSocketMessageBytes.
     EndpointOptions& maxMessage(size_t bytes) {
         maxMessage_ = bytes;
@@ -412,6 +420,7 @@ private:
     std::chrono::microseconds workerSpin_{0};
     std::function<void(uint64_t, std::shared_ptr<void>)> onSessionClose_;
     size_t window_ = 1 << 20;
+    InboundMemory inboundMemory_;
     size_t maxMessage_ = 0;
     std::chrono::seconds idleTimeout_{300};
     std::chrono::seconds stallTimeout_{30};

@@ -292,6 +292,24 @@ A connection's rings are sized by the endpoint's `maxMessage` (the largest messa
 page by page as the write position walks round them, so a connection costs up to two rings of resident memory and then
 stays flat; lower `maxMessage` for many connections.
 
+## GPU-visible receive buffers
+
+A received frame is copied once, from the socket or ring, into a block; by default that is librpc's pool, which a GPU cannot
+read. Set `EndpointOptions::inboundMemory(...)` (server) or `ClientOptions::inboundMemory` (client) to land that one copy in
+memory the caller chose: either `rpc::InboundMemory{allocate, release, ctx}` callbacks (the caller assigns the memory, e.g. per
+device), or an `rpc::PinnedPool`, a grow-only pool that registers each block once through callbacks you wire to
+`cudaHostRegister` / `cudaHostUnregister` (no CUDA dependency in librpc):
+
+```cpp
+rpc::PinnedPool pool({[](void*, void* p, size_t n) { return cudaHostRegister(p, n, cudaHostRegisterDefault) == cudaSuccess; },
+                      [](void*, void* p, size_t) { cudaHostUnregister(p); }, nullptr});
+rpc::ClientOptions options;
+options.inboundMemory = pool.memory();   // the pool must outlive every message received through it
+```
+
+C++ only (the TypeScript, C# and Python clients do not have it). See `include/rpc/memory.hpp` and design.md ("Caller-supplied
+memory for received frames").
+
 ## What you get
 
 * **Typed, header-only stubs.** `<Service>Service` (server base class; methods default to `Unimplemented`),

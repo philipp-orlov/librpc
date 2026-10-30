@@ -30,7 +30,7 @@ namespace detail {
 
 class WebSocketClientLink final : public ClientLink {
 public:
-    WebSocketClientLink(std::string_view url, const ClientOptions& options, size_t maxMessage) : pingEvery_(options.pingInterval) {
+    WebSocketClientLink(std::string_view url, const ClientOptions& options, size_t maxMessage) : pingEvery_(options.pingInterval), memory_(options.inboundMemory) {
         http::WebSocketClientOptions wsOptions;
         wsOptions.headers = options.headers;
         wsOptions.subprotocols = {kSubprotocol};
@@ -74,7 +74,7 @@ public:
                 return false;
             if (!message->binary)
                 throw LinkError("text frame from server");
-            frame.buffer = alignedCopy(reinterpret_cast<const uint8_t*>(message->data.data()), message->data.size());
+            frame.buffer = copyInbound(memory_, reinterpret_cast<const uint8_t*>(message->data.data()), message->data.size());
             frame.size = message->data.size();
             return true;
         } catch (const http::WebSocketError& error) {
@@ -87,12 +87,13 @@ public:
 private:
     http::WebSocketClient ws_;
     std::chrono::milliseconds pingEvery_;
+    InboundMemory memory_;
 };
 
 class LocalClientLink final : public ClientLink {
 public:
     LocalClientLink(const std::string& path, const ClientOptions& options)
-        : spin_(std::chrono::duration_cast<std::chrono::nanoseconds>(options.ipcSpin)) {
+        : spin_(std::chrono::duration_cast<std::chrono::nanoseconds>(options.ipcSpin)), memory_(options.inboundMemory) {
         try {
             socket_ = bufs::local::Socket::connect(path);
             IpcHello hello;
@@ -150,7 +151,7 @@ public:
                 size_t size = 0;
                 if (ring.front(data, size)) {
                     // Copied out: the server is another process and may change the bytes under us.
-                    frame.buffer = alignedCopy(data, size);
+                    frame.buffer = copyInbound(memory_, data, size);
                     frame.size = size;
                     ring.pop();
                     return true;
@@ -185,6 +186,7 @@ private:
     bufs::local::Socket socket_;
     bufs::shm::Channel channel_;
     std::chrono::nanoseconds spin_;
+    InboundMemory memory_;
     std::mutex sendMutex_;
     std::atomic<bool> closed_{false};
 };

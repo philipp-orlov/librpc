@@ -43,7 +43,7 @@ struct ServerCall {
     std::shared_ptr<Session> session;
     const Method* method = nullptr;
     uint32_t id = 0;
-    bufs::Buffer frame;  // the whole Call frame; the request message is its body
+    Block frame;  // the whole Call frame; the request message is its body
     const uint8_t* request = nullptr;
     size_t requestSize = 0;
     Clock::time_point started;
@@ -58,7 +58,7 @@ struct ServerCall {
 
     // The client's stream (client streaming and bidirectional methods). Guarded by the session's mutex.
     struct InItem {
-        bufs::Buffer frame;
+        Block frame;
         const uint8_t* data = nullptr;
         size_t size = 0;
         size_t frameBytes = 0;
@@ -272,7 +272,7 @@ public:
 
     // `onReader`: the calling thread belongs to this connection alone (a local connection's reader), so a short
     // handler may run on it.
-    void onFrame(bufs::Buffer frameBuffer, size_t size, bool onReader) {
+    void onFrame(Block frameBuffer, size_t size, bool onReader) {
         Frame frame;
         if (!parseFrame(frameBuffer.data(), size, frame))
             return fail(1002, "malformed frame");
@@ -543,7 +543,7 @@ private:
         link_->close(closeCode, message);
     }
 
-    void onCall(const wire::Envelope::Reader& env, bufs::Buffer frameBuffer, const Frame& frame, bool onReader) {
+    void onCall(const wire::Envelope::Reader& env, Block frameBuffer, const Frame& frame, bool onReader) {
         const uint32_t id = env.id();
         if (id == 0)
             return fail(1002, "call id 0");
@@ -657,7 +657,7 @@ private:
 
     // An item of the client's stream. The window the client may fill is the one the server granted; an item for a call
     // that is not reading any more is dropped and its bytes credited at once, so the client's window never leaks.
-    void onClientData(uint32_t id, bufs::Buffer frameBuffer, const Frame& frame, size_t frameBytes) {
+    void onClientData(uint32_t id, Block frameBuffer, const Frame& frame, size_t frameBytes) {
         CallRef call = findCall(id);
         const bool reading = call && (call->method->streaming == Streaming::Client || call->method->streaming == Streaming::Bidi);
         if (!reading || !frame.bodySize) {
@@ -1029,7 +1029,7 @@ public:
                 size_t size = 0;
                 if (ring.front(data, size)) {
                     // Copied out of the shared memory: the peer is another process and may change it under us.
-                    bufs::Buffer frame = alignedCopy(data, size);
+                    Block frame = copyInbound(ep_.options.inboundMemory_, data, size);
                     ring.pop();
                     session->onFrame(std::move(frame), size, true);
                     continue;
@@ -1145,13 +1145,13 @@ void EndpointImpl::attach(http::Server& target, std::string pattern) {
                 sessions.emplace(id, session);
             }
             sessionsTotal.fetch_add(1, std::memory_order_relaxed);
-            socket->onMessage([session, link](std::string_view data, bool binary) {
+            socket->onMessage([session, link, memory = options.inboundMemory_](std::string_view data, bool binary) {
                 if (!binary) {
                     link->close(1003, "text frames are not supported");
                     return;
                 }
-                // One copy, into the aligned pooled block the call keeps if this is a Call.
-                session->onFrame(alignedCopy(reinterpret_cast<const uint8_t*>(data.data()), data.size()), data.size(), false);
+                // One copy, into the aligned block (pooled, or the caller's InboundMemory) the call keeps if this is a Call.
+                session->onFrame(copyInbound(memory, reinterpret_cast<const uint8_t*>(data.data()), data.size()), data.size(), false);
             });
             socket->onClose([session, link] {
                 link->markClosed();

@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "bufs/bufs.hpp"
+#include "rpc/detail/block.hpp"
 
 namespace rpc::detail {
 
@@ -22,9 +23,9 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-/// A received frame, in 8-aligned pooled memory the receiver owns.
+/// A received frame, in 8-aligned memory the receiver owns (pooled, or the caller's InboundMemory).
 struct Inbound {
-    bufs::Buffer buffer;
+    Block buffer;
     size_t size = 0;
 };
 

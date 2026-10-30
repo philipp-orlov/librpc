@@ -251,6 +251,59 @@ void testStreaming() {
     CHECK(count == 200);
 }
 
+struct PinCount {
+    std::atomic<int> registered{0}, unregistered{0};
+};
+
+void testInboundMemory() {
+    std::puts("received frames in caller-supplied memory");
+    // The pools outlive the server and client: they must outlive every message.
+    PinCount serverPins, clientPins;
+    const auto makePool = [](PinCount& pins) {
+        return std::make_unique<rpc::PinnedPool>(rpc::PinnedPool::Registration{
+            [](void* ctx, void*, size_t) { static_cast<PinCount*>(ctx)->registered++; return true; },
+            [](void* ctx, void*, size_t) { static_cast<PinCount*>(ctx)->unregistered++; }, &pins});
+    };
+    auto serverPool = makePool(serverPins), clientPool = makePool(clientPins);
+    {
+        TestServer server(rpc::EndpointOptions().window(64 * 1024).inboundMemory(serverPool->memory()));
+        rpc::ClientOptions options;
+        options.inboundMemory = clientPool->memory();
+        CalcClient calc(server.connect(options));
+        for (int round = 0; round < 3; ++round) {
+            auto up = calc.Upload("pinned");
+            std::vector<uint8_t> data(20 * 1024, 5);
+            for (int i = 0; i < 10; ++i)
+                CHECK(up.write([&](Chunk::Builder& c) { c.setData(data.data(), data.size()); }));
+            CHECK(up.finish()->result() == 10u * 20 * 1024);
+        }
+        auto total = calc.Total();
+        for (int i = 1; i <= 10; ++i)
+            CHECK(total.write([&](CalcTotalItem::Builder& b) { b.setItem(i); }));
+        CHECK(total.finish()->result() == 55);
+    }
+    CHECK(serverPool->blocks() > 0 && clientPool->blocks() > 0);
+    CHECK(serverPool->inUse() == 0 && clientPool->inUse() == 0);
+    CHECK(serverPins.registered == static_cast<int>(serverPool->blocks()));
+    // grow-only: three rounds of the same traffic reuse blocks, they do not register new ones each time
+    CHECK(serverPool->blocks() < 40);
+    const int serverBlocks = static_cast<int>(serverPool->blocks()), clientBlocks = static_cast<int>(clientPool->blocks());
+    serverPool.reset();
+    clientPool.reset();
+    CHECK(serverPins.unregistered == serverBlocks && clientPins.unregistered == clientBlocks);
+    // allocate() refusing (nullptr) falls back to librpc's own pool
+    {
+        rpc::InboundMemory refuse;
+        refuse.allocate = [](void*, size_t) -> void* { return nullptr; };
+        refuse.release = [](void*, void*, size_t) { std::abort(); };
+        TestServer server(rpc::EndpointOptions().inboundMemory(refuse));
+        CalcClient calc(server.connect());
+        auto total = calc.Total();
+        total.write([&](CalcTotalItem::Builder& b) { b.setItem(4); });
+        CHECK(total.finish()->result() == 4);
+    }
+}
+
 void testStreamsFromTheClient() {
     std::puts("client streaming and bidirectional calls");
     // A window of 64 KiB: what the client uploads is held back until the server has read it.
@@ -785,6 +838,7 @@ void runAll() {
     testBadRequests();
     testStreaming();
     testStreamsFromTheClient();
+    testInboundMemory();
     testDeadlinesAndCancel();
     testConcurrency();
     testAuth();

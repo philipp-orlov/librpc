@@ -70,7 +70,7 @@ include(cmake/RpcGenerate.cmake)
 
 # --- the runtime --------------------------------------------------------------------------------------------
 set(RPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-add_library(rpc STATIC src/status.cpp src/server.cpp src/client.cpp)
+add_library(rpc STATIC src/memory.cpp src/status.cpp src/server.cpp src/client.cpp)
 add_library(rpc::rpc ALIAS rpc)
 target_include_directories(rpc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
