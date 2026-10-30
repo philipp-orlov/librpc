@@ -3,7 +3,7 @@
 RPC for C++17, TypeScript, C# and Python, over WebSockets and over local sockets, on top of [libhttp](../libhttp) and
 [libbufs](../libbufs). You write a service as signatures,
 
-```
+```protobuf
 rpc_service Calc {
     Add(a: double, b: double): double;
     Count(from: int, to: int, step: int = 1): stream Tick;
@@ -28,7 +28,7 @@ built to run for months without growing: pooled messages, recycled call objects,
 
 `calc.bufs`:
 
-```
+```protobuf
 namespace sample.calc;
 
 table Tick { n: int; label: string; }
@@ -318,7 +318,7 @@ The copy above is still a copy, and the application's own write into the request
 socket** (raw pixels, audio samples) a `[ubyte]` field marked `(shared)` skips both: the client writes it once, into memory
 the server reads in place.
 
-```
+```protobuf
 table Frame { sequence:ulong; pixels:[ubyte] (shared); }
 rpc_service Vision {
     Recognize(pixels:[ubyte] (shared), width:int, height:int): Result;
