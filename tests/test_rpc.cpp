@@ -84,7 +84,10 @@ uint16_t freePort() {
 // A Calc + Kitchens server on its own port, running on its own thread.
 class TestServer {
 public:
-    explicit TestServer(rpc::EndpointOptions options = {}, std::chrono::milliseconds grace = 5s) : port_(freePort()) {
+    // `blobs`: a Blobs service of the caller's, which may then outlive the server.
+    explicit TestServer(rpc::EndpointOptions options = {}, std::chrono::milliseconds grace = 5s,
+                        test::BlobsImpl* blobs = nullptr)
+        : port_(freePort()) {
         options.onCall([this](const rpc::CallInfo& call) {
             std::lock_guard<std::mutex> lock(mutex_);
             finished_.push_back({std::string(call.method), call.status.code()});
@@ -95,7 +98,7 @@ public:
         config.port = port_;
         config.ioThreads = 2;
         listener_ = std::make_unique<rpc::Listener>(config, std::move(options));
-        listener_->add(calc_).add(kitchens_).add(natural_).add(blobs_);
+        listener_->add(calc_).add(kitchens_).add(natural_).add(blobs ? *blobs : blobs_);
         localPath_ = "/tmp/librpc-test-" + std::to_string(::getpid()) + "-" + std::to_string(port_) + ".sock";
         listener_->listenLocal(localPath_);
         thread_ = std::thread([this, grace] { listener_->run({}, grace); });
@@ -1136,6 +1139,46 @@ void testIdleStreamReadHonorsDeadline() {
     g_local = before;
 }
 
+// Items kept with take() are the application's: it may release them after the endpoint, even the client, is gone.
+void testTakenOutlivesTheEndpoint() {
+    std::puts("shared blobs: retained items released after the endpoint");
+    const bool before = g_local;
+    for (const bool local : {true, false}) {
+        g_local = local;
+        for (const bool clientOutlives : {false, true}) {
+            test::BlobsImpl service;  // outlives the endpoint
+            std::optional<rpc::Client> client;
+            {
+                TestServer server(blobEndpoint(), 5s, &service);
+                client.emplace(server.connect(blobClient(1 << 20)));
+                test::BlobsClient blobs(*client);
+                auto keep = blobs.Keep();
+                for (int i = 0; i < 3; ++i) {
+                    rpc::SharedBuffer buffer = client->allocateShared(4096);
+                    fillPattern(buffer.data(), buffer.size(), 20 + i);
+                    if (buffer.shared())
+                        CHECK(keep.write([&](test::Frame::Builder& p) { p.setSequence(i); },
+                                         rpc::Share{test::FrameShared::pixels, std::move(buffer)}));
+                    else  // over a WebSocket the bytes travel inline
+                        CHECK(keep.write([&](test::Frame::Builder& p) { p.setSequence(i); p.setPixels(buffer.data(), buffer.size()); }));
+                }
+                CHECK(keep.finish()->result() == 3u);
+                CHECK(eventually([&] { return service.describeHeld().size() == 3; }));
+                if (!clientOutlives)
+                    client.reset();
+            }  // the endpoint is gone; the service still holds three items
+            const auto held = service.describeHeld();
+            CHECK(held.size() == 3);
+            for (int i = 0; i < 3 && i < static_cast<int>(held.size()); ++i)
+                CHECK(held[i] == expectedLine(4096, 20 + i, local));
+            std::thread other([&] { service.releaseHeld(); });
+            other.join();
+            CHECK(service.describeHeld().empty());
+        }
+    }
+    g_local = before;
+}
+
 // A 25 MB blob through rings a fraction of its size.
 void testBlobsLarge() {
     std::puts("shared blobs: far larger than the ring");
@@ -1625,6 +1668,7 @@ int main(int argc, char** argv) {
     testBlobsLeases();
     testBlobsLarge();
     testIdleStreamReadHonorsDeadline();
+    testTakenOutlivesTheEndpoint();
     testBlobsValidation();
     testBlobsHandshake();
     testBlobsRegistration();

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <list>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -72,11 +73,39 @@ inline Blob leaseBlob(const BlobLease& lease) {
 }
 
 // An item of the client's stream that a handler took out of its reader (ServerReader::take). Pooled like calls.
+struct TakenPool;
 struct TakenItem {
-    EndpointImpl* owner = nullptr;
+    // The pool the item came from, held only while a handler has it checked out, so that a Taken released after the
+    // endpoint is gone still finds its pool. Moved out before the item goes back to the idle list: the pool owns
+    // every item, and an idle item holding the pool would be a cycle.
+    std::shared_ptr<TakenPool> pool;
     std::shared_ptr<Session> session;
+    InboundMemory memory;  // the endpoint's, copied at take(): the Session's reference to its endpoint may dangle
     Block frame;
     Leases leases;
+};
+
+// What retained stream items need from their endpoint, kept alive by the endpoint and by every checked-out item:
+// ServerReader::take() hands items to the application, which may release them after the endpoint was destroyed.
+struct TakenPool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<TakenItem>> all;
+    std::vector<TakenItem*> idle;
+    std::atomic<uint64_t> blobsInline{0};  // Endpoint::Stats::blobsInline
+
+    // Held shared while a release notifies the client, exclusive to retire: nothing talks to the endpoint's
+    // transport once the endpoint is on its way out.
+    std::shared_mutex gate;
+    bool alive = true;
+
+    void retire() {
+        std::unique_lock<std::shared_mutex> lock(gate);
+        alive = false;
+    }
+    void recycle(TakenItem* item) {
+        std::lock_guard<std::mutex> lock(mutex);
+        idle.push_back(item);
+    }
 };
 
 // One call. Pooled: the objects are recycled through EndpointImpl, so a warm server allocates nothing per call,
@@ -189,6 +218,7 @@ struct EndpointImpl {
         arenaAccount->cap = options.sharedArenaTotal_;
         arenaAccount->registration = options.sharedRegistration_;
     }
+    ~EndpointImpl() { taken->retire(); }
 
     EndpointOptions options;
     Registry registry;
@@ -213,28 +243,23 @@ struct EndpointImpl {
     std::atomic<uint64_t> failed{0};
     std::atomic<uint64_t> rejected{0};
     std::atomic<uint64_t> blobsShared{0};
-    std::atomic<uint64_t> blobsInline{0};
+    std::shared_ptr<TakenPool> taken = std::make_shared<TakenPool>();
+    std::atomic<uint64_t>& blobsInline = taken->blobsInline;
     std::shared_ptr<ArenaAccount> arenaAccount;  // shared with the areas, which may outlive us (a held Taken)
 
     // Recycled stream items taken out of readers.
-    std::mutex takenMutex;
-    std::vector<std::unique_ptr<TakenItem>> allTaken;
-    std::vector<TakenItem*> freeTaken;
-
     TakenItem* acquireTaken() {
-        std::lock_guard<std::mutex> lock(takenMutex);
-        if (freeTaken.empty()) {
-            allTaken.push_back(std::make_unique<TakenItem>());
-            allTaken.back()->owner = this;
-            return allTaken.back().get();
+        std::lock_guard<std::mutex> lock(taken->mutex);
+        TakenItem* item;
+        if (taken->idle.empty()) {
+            taken->all.push_back(std::make_unique<TakenItem>());
+            item = taken->all.back().get();
+        } else {
+            item = taken->idle.back();
+            taken->idle.pop_back();
         }
-        TakenItem* item = freeTaken.back();
-        freeTaken.pop_back();
+        item->pool = taken;
         return item;
-    }
-    void recycleTaken(TakenItem* item) {
-        std::lock_guard<std::mutex> lock(takenMutex);
-        freeTaken.push_back(item);
     }
 
     // Recycled calls.
@@ -866,6 +891,16 @@ public:
             flushReleases();
     }
 
+    // A retained item is released: its blocks go back to the client, unless the connection or the whole endpoint is gone
+    // (the application may release long after either), in which case only the local references are dropped.
+    void dropTakenLeases(Leases& leases, TakenPool& pool) {
+        std::shared_lock<std::shared_mutex> guard(pool.gate);
+        if (pool.alive && !closed())
+            dropLeases(leases, true);
+        else
+            leases.clear();
+    }
+
     // Queues every reference the frame lists, valid or not: the client counts them as lent until told otherwise.
     void releaseListed(const wire::Envelope::Reader& env) {
         for (const wire::BlobRef& ref : env.blobs())
@@ -900,6 +935,7 @@ public:
             return nullptr;
         TakenItem* item = ep_.acquireTaken();
         item->session = shared_from_this();
+        item->memory = ep_.options.inboundMemory_;
         item->frame = std::move(call.current.frame);
         item->leases = std::move(call.current.leases);
         call.current = ServerCall::InItem();
@@ -1672,12 +1708,12 @@ void StreamWriter::setTrailer(const uint8_t* message, size_t size) {
 bool StreamReader::next(const uint8_t*& message, size_t& size) { return call_->session->readerNext(*call_, message, size); }
 
 namespace {
-Blob inlineBlobOf(detail::EndpointImpl& ep, const InboundMemory& memory, const uint8_t* data, size_t size) {
+Blob inlineBlobOf(std::atomic<uint64_t>& counter, const InboundMemory& memory, const uint8_t* data, size_t size) {
     Blob blob;
     blob.data = data;
     blob.size = size;
     if (size) {
-        ep.blobsInline.fetch_add(1, std::memory_order_relaxed);
+        counter.fetch_add(1, std::memory_order_relaxed);
         if (memory.device)
             blob.device = memory.device(memory.ctx, data);
     }
@@ -1688,7 +1724,7 @@ Blob inlineBlobOf(detail::EndpointImpl& ep, const InboundMemory& memory, const u
 Blob ServerContext::blob(uint32_t field, const uint8_t* inlineData, size_t inlineSize) const {
     if (const detail::BlobLease* lease = call_->blobs.find(field))
         return detail::leaseBlob(*lease);
-    return inlineBlobOf(*call_->owner, call_->session->inboundMemory(), inlineData, inlineSize);
+    return inlineBlobOf(call_->owner->blobsInline, call_->session->inboundMemory(), inlineData, inlineSize);
 }
 
 bool StreamReader::currentBlob(uint32_t field, Blob& out) const {
@@ -1700,7 +1736,7 @@ bool StreamReader::currentBlob(uint32_t field, Blob& out) const {
 }
 
 Blob StreamReader::inlineBlob(const uint8_t* data, size_t size) const {
-    return inlineBlobOf(*call_->owner, call_->session->inboundMemory(), data, size);
+    return inlineBlobOf(call_->owner->blobsInline, call_->session->inboundMemory(), data, size);
 }
 
 detail::TakenItem* StreamReader::takeCurrent() { return call_->session->takeCurrent(*call_); }
@@ -1716,15 +1752,16 @@ bool takenBlob(const TakenItem* item, uint32_t field, Blob& out) {
 }
 
 Blob takenInline(const TakenItem* item, const uint8_t* data, size_t size) {
-    return inlineBlobOf(*item->owner, item->session->inboundMemory(), data, size);
+    return inlineBlobOf(item->pool->blobsInline, item->memory, data, size);
 }
 
 void releaseTaken(TakenItem* item) noexcept {
     // The blocks go back to the client now, from whichever thread this is.
     std::shared_ptr<Session> session = std::move(item->session);
-    session->dropLeases(item->leases, true);
+    std::shared_ptr<TakenPool> pool = std::move(item->pool);
+    session->dropTakenLeases(item->leases, *pool);
     item->frame.reset();
-    item->owner->recycleTaken(item);
+    pool->recycle(item);  // `pool` may be the last reference: the item is not touched again
 }
 
 } // namespace detail
