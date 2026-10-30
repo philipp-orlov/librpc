@@ -260,8 +260,9 @@ void testInboundMemory() {
     // The pools outlive the server and client: they must outlive every message.
     PinCount serverPins, clientPins;
     const auto makePool = [](PinCount& pins) {
-        return std::make_unique<rpc::PinnedPool>(rpc::PinnedPool::Registration{
-            [](void* ctx, void*, size_t) { static_cast<PinCount*>(ctx)->registered++; return true; },
+        // The fake device address is the block's own plus 1, so device() can be told from the host address.
+        return std::make_unique<rpc::PinnedPool>(rpc::DeviceRegistration{
+            [](void* ctx, void* p, size_t) -> void* { static_cast<PinCount*>(ctx)->registered++; return static_cast<uint8_t*>(p) + 1; },
             [](void* ctx, void*, size_t) { static_cast<PinCount*>(ctx)->unregistered++; }, &pins});
     };
     auto serverPool = makePool(serverPins), clientPool = makePool(clientPins);
@@ -283,6 +284,24 @@ void testInboundMemory() {
         CHECK(total.finish()->result() == 55);
     }
     CHECK(serverPool->blocks() > 0 && clientPool->blocks() > 0);
+    {
+        // device(): the registration's address for any byte of a block, nullptr elsewhere
+        rpc::PinnedPool pool({[](void*, void* p, size_t) -> void* { return static_cast<uint8_t*>(p) + 1; }, [](void*, void*, size_t) {}, nullptr});
+        const rpc::InboundMemory memory = pool.memory();
+        auto* a = static_cast<uint8_t*>(memory.allocate(memory.ctx, 5000));
+        auto* b = static_cast<uint8_t*>(memory.allocate(memory.ctx, 100));
+        CHECK(a && b);
+        CHECK(pool.device(a) == a + 1 && pool.device(a + 4999) == a + 5000 && pool.device(b + 99) == b + 100);
+        CHECK(memory.device(memory.ctx, a + 8) == a + 9);
+        int outside = 0;
+        CHECK(pool.device(&outside) == nullptr);
+        memory.release(memory.ctx, a, 5000);
+        memory.release(memory.ctx, b, 100);
+        rpc::PinnedPool plain;  // no registration: nothing is device-visible
+        auto* c = static_cast<uint8_t*>(plain.memory().allocate(plain.memory().ctx, 64));
+        CHECK(plain.device(c) == nullptr);
+        plain.memory().release(plain.memory().ctx, c, 64);
+    }
     CHECK(serverPool->inUse() == 0 && clientPool->inUse() == 0);
     CHECK(serverPins.registered == static_cast<int>(serverPool->blocks()));
     // grow-only: three rounds of the same traffic reuse blocks, they do not register new ones each time

@@ -18,6 +18,7 @@
 
 #include "bufs/local.hpp"
 #include "bufs/shm.hpp"
+#include "arena.hpp"
 #include "http/thread_pool.hpp"
 #include "ipc_common.hpp"
 #include "json/json.hpp"
@@ -35,6 +36,49 @@ struct AcceptInfo {
     std::optional<Principal> principal;
 };
 
+// A block of the client's shared area lent to a call or a stream item. Holds the area, so it stays mapped (and
+// registered) for as long as anything reads it.
+struct BlobLease {
+    ArenaRef arena;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    uint32_t field = 0;
+};
+
+struct Leases {
+    BlobLease items[kMaxBlobsPerMessage];
+    uint8_t count = 0;
+
+    void clear() noexcept {
+        for (uint8_t i = 0; i < count; ++i)
+            items[i] = BlobLease();
+        count = 0;
+    }
+    const BlobLease* find(uint32_t field) const noexcept {
+        for (uint8_t i = 0; i < count; ++i)
+            if (items[i].field == field)
+                return &items[i];
+        return nullptr;
+    }
+};
+
+inline Blob leaseBlob(const BlobLease& lease) {
+    Blob blob;
+    blob.data = lease.arena->base() + lease.offset;
+    blob.size = static_cast<size_t>(lease.length);
+    blob.device = lease.arena->device(lease.offset);
+    blob.shared = true;
+    return blob;
+}
+
+// An item of the client's stream that a handler took out of its reader (ServerReader::take). Pooled like calls.
+struct TakenItem {
+    EndpointImpl* owner = nullptr;
+    std::shared_ptr<Session> session;
+    Block frame;
+    Leases leases;
+};
+
 // One call. Pooled: the objects are recycled through EndpointImpl, so a warm server allocates nothing per call,
 // and the memory does not fragment. Reference counted by hand (CallRef) because std::shared_ptr would allocate.
 struct ServerCall {
@@ -50,6 +94,8 @@ struct ServerCall {
     Clock::time_point deadline = Clock::time_point::max();
     std::atomic<bool> cancelled{false};
     std::atomic<bool> stalled{false};  // the client stopped reading its stream
+    std::atomic<uint16_t> abortCode{0};  // a Code the call must end with (a stream item that broke the rules); 0 = none
+    Leases blobs;  // the request's blobs; they return to the client with the call's End
     uint64_t responseBytes = 0;
     bufs::Buffer trailer;  // a stream's closing message, if the handler set one (it travels behind the Ok End)
     size_t trailerSize = 0;
@@ -62,6 +108,7 @@ struct ServerCall {
         const uint8_t* data = nullptr;
         size_t size = 0;
         size_t frameBytes = 0;
+        Leases leases;  // the item's blobs; they go back to the client in a Release frame when the item is dropped
     };
     std::vector<InItem> inbox;  // a ring that keeps its capacity
     size_t inHead = 0;
@@ -138,7 +185,10 @@ private:
 struct LocalConnection;
 
 struct EndpointImpl {
-    explicit EndpointImpl(EndpointOptions o) : options(std::move(o)) {}
+    explicit EndpointImpl(EndpointOptions o) : options(std::move(o)), arenaAccount(std::make_shared<ArenaAccount>()) {
+        arenaAccount->cap = options.sharedArenaTotal_;
+        arenaAccount->registration = options.sharedRegistration_;
+    }
 
     EndpointOptions options;
     Registry registry;
@@ -162,6 +212,30 @@ struct EndpointImpl {
     std::atomic<uint64_t> calls{0};
     std::atomic<uint64_t> failed{0};
     std::atomic<uint64_t> rejected{0};
+    std::atomic<uint64_t> blobsShared{0};
+    std::atomic<uint64_t> blobsInline{0};
+    std::shared_ptr<ArenaAccount> arenaAccount;  // shared with the areas, which may outlive us (a held Taken)
+
+    // Recycled stream items taken out of readers.
+    std::mutex takenMutex;
+    std::vector<std::unique_ptr<TakenItem>> allTaken;
+    std::vector<TakenItem*> freeTaken;
+
+    TakenItem* acquireTaken() {
+        std::lock_guard<std::mutex> lock(takenMutex);
+        if (freeTaken.empty()) {
+            allTaken.push_back(std::make_unique<TakenItem>());
+            allTaken.back()->owner = this;
+            return allTaken.back().get();
+        }
+        TakenItem* item = freeTaken.back();
+        freeTaken.pop_back();
+        return item;
+    }
+    void recycleTaken(TakenItem* item) {
+        std::lock_guard<std::mutex> lock(takenMutex);
+        freeTaken.push_back(item);
+    }
 
     // Recycled calls.
     std::mutex callMutex;
@@ -204,6 +278,7 @@ struct EndpointImpl {
         }
         call->cancelled.store(false, std::memory_order_relaxed);
         call->stalled.store(false, std::memory_order_relaxed);
+        call->abortCode.store(0, std::memory_order_relaxed);
         call->deadline = Clock::time_point::max();
         call->responseBytes = 0;
         call->trailerSize = 0;
@@ -218,6 +293,7 @@ struct EndpointImpl {
     void recycle(ServerCall* call) {
         call->session.reset();
         call->frame.reset();
+        call->blobs.clear();
         call->resetInbox();
         call->request = nullptr;
         call->requestSize = 0;
@@ -240,6 +316,11 @@ void CallRef::release() noexcept {
 
 // ---- the protocol core ------------------------------------------------------------------------------------------
 
+struct ReleaseEntry {
+    uint64_t offset;
+    uint64_t length;
+};
+
 class Session : public std::enable_shared_from_this<Session> {
 public:
     friend class ::rpc::StreamReader;
@@ -253,6 +334,7 @@ public:
     }
 
     uint64_t id() const { return id_; }
+    const InboundMemory& inboundMemory() const { return ep_.options.inboundMemory_; }
     const Principal& principal() const { return *principal_; }
     std::string_view remoteAddress() const { return link_->remoteAddress(); }
     bool closed() const { return closed_.load(std::memory_order_acquire); }
@@ -285,7 +367,7 @@ public:
         switch (env.kind()) {
         case wire::Kind::Call: return onCall(env, std::move(frameBuffer), frame, onReader);
         case wire::Kind::Cancel: return onCancel(env.id());
-        case wire::Kind::Data: return onClientData(env.id(), std::move(frameBuffer), frame, size);
+        case wire::Kind::Data: return onClientData(env, std::move(frameBuffer), frame, size);
         case wire::Kind::End: return onClientEnd(env.id());
         case wire::Kind::Credit: return onCredit(env.credit());
         case wire::Kind::Ping: {
@@ -427,7 +509,9 @@ public:
         }
         if (method.streaming == Streaming::Client || method.streaming == Streaming::Bidi)
             releaseInbox(*call);
-        if (call->stalled.load())
+        if (const uint16_t aborted = call->abortCode.load(std::memory_order_acquire))
+            status = Status(static_cast<Code>(aborted), "bad blob reference");
+        else if (call->stalled.load())
             status = Status(Code::Unavailable, "client is not reading its stream");
         else if (status.code() == Code::Cancelled && ep_.closing.load())
             status = Status(Code::Unavailable, "server is shutting down");  // cancelled because we are going away
@@ -521,6 +605,9 @@ private:
             window = static_cast<size_t>(env.window());
         setLimits(message, window);
         phase_ = Phase::Ready;
+        uint64_t arenaBytes = 0;
+        if (env.arena() > 0)
+            arenaBytes = adoptArena(env.arena());
         const auto welcome = envelope([&](wire::Envelope::Builder& e) {
             e.setKind(wire::Kind::Welcome);
             e.setProtocol(kProtocol);
@@ -529,8 +616,28 @@ private:
             e.setWindow(window);
             e.setMaxMessage(static_cast<uint32_t>(message));
             e.setMaxInflight(static_cast<uint32_t>(ep_.options.maxInflight_));
+            if (arenaBytes)
+                e.setArena(arenaBytes);
         });
         link_->send(welcome.first, welcome.second, nullptr, 0);
+    }
+
+    // The client announced a shared area of `bytes`: takes it from the link and validates it. Returns the bytes
+    // accepted, 0 when the connection goes on without one (the client falls back to inline fields). The message is
+    // always drained, so a refused memfd is closed here.
+    uint64_t adoptArena(uint64_t bytes) {
+        bufs::Fd fd;
+        if (!link_->takeArena(bytes, fd))
+            return 0;
+        const uint64_t offeredMiB = std::min<uint64_t>((ep_.options.sharedArena_ + (1u << 20) - 1) >> 20, UINT32_MAX);
+        if (offeredMiB == 0 || bytes > (offeredMiB << 20))
+            return 0;
+        const char* why = nullptr;
+        SessionArena* arena = SessionArena::adopt(std::move(fd), bytes, ep_.arenaAccount, why);
+        if (!arena)
+            return 0;
+        arena_ = ArenaRef::adopt(arena);
+        return bytes;
     }
 
     void rejectHello(Code code, const char* message, uint16_t closeCode) {
@@ -547,6 +654,8 @@ private:
         const uint32_t id = env.id();
         if (id == 0)
             return fail(1002, "call id 0");
+        if (!blobsAllowed(env))
+            return;
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (const CallRef& call : calls_)
@@ -566,7 +675,11 @@ private:
         const Method* method = ep_.registry.find(env.method());
         if (!method)
             return reject(Code::Unimplemented, "unknown method");
+        Leases leases;
+        if (env.hasBlobs() && !takeBlobs(env, method->sharedFields, leases))
+            return reject(Code::InvalidArgument, "bad blob reference");
         CallRef call = ep_.acquireCall();
+        call->blobs = std::move(leases);
         call->session = shared_from_this();
         call->method = method;
         call->id = id;
@@ -655,22 +768,173 @@ private:
         return CallRef();
     }
 
+public:
+    // ---- blobs ----
+
+    // The protocol rules a frame with blobs must keep whatever the method: at most kMaxBlobsPerMessage, and only on a
+    // connection that has a shared area. Breaking them closes the connection. False: it was closed.
+    bool blobsAllowed(const wire::Envelope::Reader& env) {
+        const size_t count = env.blobs().size();
+        if (count == 0)
+            return true;
+        if (count > kMaxBlobsPerMessage) {
+            fail(1002, "too many blobs");
+            return false;
+        }
+        if (!arena_) {
+            fail(1002, "blobs without a shared area");
+            return false;
+        }
+        return true;
+    }
+
+    // Turns the blob references of a Call or Data frame into leases, if every one is valid: a field the method marks
+    // shared (`sharedMask`, a bit per slot), 8-aligned, inside the area (no overflow), listed once. False: the call
+    // (or item) is a client error; `out` is empty.
+    bool takeBlobs(const wire::Envelope::Reader& env, uint64_t sharedMask, Leases& out) {
+        out.count = 0;
+        const bufs::Vector<wire::BlobRef> refs = env.blobs();
+        const uint64_t bytes = arena_->bytes();
+        for (uint32_t i = 0; i < refs.size(); ++i) {
+            const wire::BlobRef& ref = refs[i];
+            bool ok = ref.field < 64 && ((sharedMask >> ref.field) & 1) && ref.offset % 8 == 0 && ref.offset <= bytes &&
+                      ref.length <= bytes - ref.offset;
+            for (uint8_t j = 0; ok && j < out.count; ++j)
+                ok = out.items[j].field != ref.field;
+            if (!ok) {
+                out.clear();
+                return false;
+            }
+            BlobLease& lease = out.items[out.count++];
+            lease.arena = ArenaRef(arena_.get());
+            lease.offset = ref.offset;
+            lease.length = ref.length;
+            lease.field = ref.field;
+        }
+        ep_.blobsShared.fetch_add(refs.size(), std::memory_order_relaxed);
+        return true;
+    }
+
+    // ---- giving blocks back ----
+
+    // Appends to the batch of blocks the client may reuse; a full batch goes out at once. Any thread; never call it
+    // with a lock held (it may send).
+    void queueRelease(uint64_t offset, uint64_t length) {
+        ReleaseEntry batch[kReleaseBatch];
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lock(releaseMu_);
+            releaseQueue_[releaseCount_++] = {offset, length};
+            releasePending_.store(static_cast<uint32_t>(releaseCount_), std::memory_order_relaxed);
+            if (releaseCount_ == kReleaseBatch) {
+                std::copy(releaseQueue_, releaseQueue_ + releaseCount_, batch);
+                n = releaseCount_;
+                releaseCount_ = 0;
+                releasePending_.store(0, std::memory_order_relaxed);
+            }
+        }
+        if (n)
+            sendRelease(batch, n);
+    }
+
+    // Sends what is queued as one Release frame.
+    void flushReleases() {
+        if (releasePending_.load(std::memory_order_relaxed) == 0)
+            return;
+        ReleaseEntry batch[kReleaseBatch];
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lock(releaseMu_);
+            std::copy(releaseQueue_, releaseQueue_ + releaseCount_, batch);
+            n = releaseCount_;
+            releaseCount_ = 0;
+            releasePending_.store(0, std::memory_order_relaxed);
+        }
+        if (n)
+            sendRelease(batch, n);
+    }
+
+    // The reading thread has nothing to read: a good moment to tell the client what it can reuse.
+    void onIdle() { flushReleases(); }
+
+    // An item's blobs are not needed any more.
+    void dropLeases(Leases& leases, bool flushNow) {
+        for (uint8_t i = 0; i < leases.count; ++i)
+            queueRelease(leases.items[i].offset, leases.items[i].length);
+        leases.clear();
+        if (flushNow)
+            flushReleases();
+    }
+
+    // Queues every reference the frame lists, valid or not: the client counts them as lent until told otherwise.
+    void releaseListed(const wire::Envelope::Reader& env) {
+        for (const wire::BlobRef& ref : env.blobs())
+            queueRelease(ref.offset, ref.length);
+    }
+
+    void sendRelease(const ReleaseEntry* entries, size_t count) {
+        const auto env = envelope([&](wire::Envelope::Builder& e) {
+            e.setKind(wire::Kind::Release);
+            auto list = e.initBlobs(count);
+            for (size_t i = 0; i < count; ++i) {
+                wire::BlobRef ref;
+                ref.field = 0;
+                ref.reserved = 0;
+                ref.offset = entries[i].offset;
+                ref.length = entries[i].length;
+                list.set(i, ref);
+            }
+        });
+        link_->send(env.first, env.second, nullptr, 0);
+    }
+
+    // The handler's current item is finished with: its blobs go back to the client (batched).
+    void dropCurrent(ServerCall& call) {
+        dropLeases(call.current.leases, false);
+        call.current = ServerCall::InItem();
+    }
+
+    // ServerReader::take: the current item, with its frame and blobs, handed to the handler for good.
+    TakenItem* takeCurrent(ServerCall& call) {
+        if (!call.current.frame)
+            return nullptr;
+        TakenItem* item = ep_.acquireTaken();
+        item->session = shared_from_this();
+        item->frame = std::move(call.current.frame);
+        item->leases = std::move(call.current.leases);
+        call.current = ServerCall::InItem();
+        return item;
+    }
+
     // An item of the client's stream. The window the client may fill is the one the server granted; an item for a call
     // that is not reading any more is dropped and its bytes credited at once, so the client's window never leaks.
-    void onClientData(uint32_t id, Block frameBuffer, const Frame& frame, size_t frameBytes) {
-        CallRef call = findCall(id);
+    void onClientData(const wire::Envelope::Reader& env, Block frameBuffer, const Frame& frame, size_t frameBytes) {
+        if (!blobsAllowed(env))
+            return;
+        CallRef call = findCall(env.id());
         const bool reading = call && (call->method->streaming == Streaming::Client || call->method->streaming == Streaming::Bidi);
-        if (!reading || !frame.bodySize) {
+        Leases leases;
+        bool badBlobs = false;
+        if (reading && env.hasBlobs() && !takeBlobs(env, call->method->itemSharedFields, leases))
+            badBlobs = true;
+        if (!reading || !frame.bodySize || badBlobs) {
+            if (env.hasBlobs())
+                releaseListed(env);  // nobody will read them
+            if (badBlobs) {
+                // A client bug, not a dead connection: this call ends InvalidArgument.
+                call->abortCode.store(static_cast<uint16_t>(Code::InvalidArgument), std::memory_order_release);
+                call->cancel();
+                cv_.notify_all();
+            }
             sendCredit(frameBytes);
             return;
         }
+        bool dropped = false;
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (call->inClosed) {
-                sendCredit(frameBytes);
-                return;
-            }
-            if (call->inBytes + frameBytes > 2 * window_ + maxFrame_) {
+                dropped = true;
+            } else if (call->inBytes + frameBytes > 2 * window_ + maxFrame_) {
                 lockViolation_ = true;
             } else {
                 ServerCall::InItem item;
@@ -678,15 +942,23 @@ private:
                 item.data = frame.bodyData;
                 item.size = frame.bodySize;
                 item.frameBytes = frameBytes;
+                item.leases = std::move(leases);
                 call->inBytes += frameBytes;
                 call->pushItem(std::move(item));
             }
+        }
+        if (dropped) {
+            if (env.hasBlobs())
+                releaseListed(env);
+            sendCredit(frameBytes);
+            return;
         }
         if (lockViolation_)
             return fail(1008, "client exceeded its window");
         cv_.notify_all();
     }
 
+private:
     void onClientEnd(uint32_t id) {
         CallRef call = findCall(id);
         if (!call)
@@ -700,10 +972,18 @@ private:
 
     // StreamReader::next. Hands the handler the next item and credits what has been read once a quarter window has piled
     // up or the queue is empty (a sender holding a frame larger than the room left would otherwise wait forever).
+    // The previous item is done with: its blobs are queued for the client, and flushed whenever the handler is about to
+    // wait or the client is about to be credited.
     bool readerNext(ServerCall& call, const uint8_t*& message, size_t& size) {
+        dropCurrent(call);
         uint64_t report = 0;
         {
             std::unique_lock<std::mutex> lock(mu_);
+            if (call.inCount == 0 && !call.inClosed && !call.cancelled.load() && !closed()) {
+                lock.unlock();
+                flushReleases();  // about to wait: tell the client what it can reuse
+                lock.lock();
+            }
             cv_.wait(lock, [&] { return call.inCount != 0 || call.inClosed || call.cancelled.load() || closed(); });
             if (call.cancelled.load() || closed() || call.inCount == 0)
                 return false;
@@ -716,24 +996,35 @@ private:
                 call.inConsumed = 0;
             }
         }
-        if (report)
+        if (report) {
+            flushReleases();
             sendCredit(report);
+        }
         message = call.current.data;
         size = call.current.size;
         return true;
     }
 
-    // The handler is done: whatever the client sent that nobody read is credited, so its window is whole again.
+    // The handler is done: whatever the client sent that nobody read is credited, so its window is whole again, and the
+    // blobs of every item go back.
     void releaseInbox(ServerCall& call) {
         uint64_t leftover = 0;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            leftover = call.inBytes + call.inConsumed;
-            call.inBytes = call.inConsumed = 0;
-            call.inClosed = true;
-            while (call.inCount)
-                call.popItem();
+        dropCurrent(call);
+        for (;;) {
+            ServerCall::InItem item;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (call.inCount == 0) {
+                    leftover = call.inBytes + call.inConsumed;
+                    call.inBytes = call.inConsumed = 0;
+                    call.inClosed = true;
+                    break;
+                }
+                item = call.popItem();
+            }
+            dropLeases(item.leases, false);
         }
+        flushReleases();
         if (leftover && !closed())
             sendCredit(leftover);
     }
@@ -846,6 +1137,15 @@ private:
     bool goodbye_ = false;
     bool lockViolation_ = false;
     std::shared_ptr<void> state_;
+
+    ArenaRef arena_;  // the client's shared area, if one was accepted (set at Hello; the reading thread)
+
+    // Blocks the client may reuse, batched into Release frames.
+    static constexpr size_t kReleaseBatch = 64;
+    std::mutex releaseMu_;
+    ReleaseEntry releaseQueue_[kReleaseBatch];
+    size_t releaseCount_ = 0;
+    std::atomic<uint32_t> releasePending_{0};
 };
 
 void ServerCall::cancel() {
@@ -1018,6 +1318,22 @@ public:
 
     std::string_view remoteAddress() const override { return peer_; }
     bool dedicatedReader() const noexcept override { return true; }
+    bool takeArena(uint64_t bytes, bufs::Fd& fd) override {
+        // The client sent it before its Hello; the socket is non-blocking, so a message that never came is just absent.
+        IpcArena message;
+        bufs::local::ReceivedFds fds;
+        long got = 0;
+        try {
+            got = socket_.receive(&message, sizeof message, fds);
+        } catch (const std::exception&) {
+            return false;
+        }
+        if (got != static_cast<long>(sizeof message) || fds.count != 1 || message.magic != IpcArena::kMagic ||
+            message.version != 1 || message.bytes != bytes)
+            return false;  // fds closes whatever came
+        fd = fds.take(0);
+        return true;
+    }
     size_t maxFrame() const noexcept override { return const_cast<bufs::shm::Channel&>(channel_).send().maxMessageBytes(); }
 
     // The reading thread.
@@ -1034,6 +1350,7 @@ public:
                     session->onFrame(std::move(frame), size, true);
                     continue;
                 }
+                session->onIdle();
                 if (peerGone())
                     break;
                 ring.wait(std::chrono::milliseconds(50), spin_);  // slices: close() and a dead peer are noticed
@@ -1194,6 +1511,7 @@ void EndpointImpl::acceptLoop() {
                     const ucred peer = socket.peer();
                     IpcHello hello;
                     hello.ringBytes = ringCapacity;
+                    hello.arenaMiB = static_cast<uint32_t>(std::min<uint64_t>((options.sharedArena_ + (1u << 20) - 1) >> 20, UINT32_MAX));
                     std::optional<Principal> principal;
                     unsigned refusal = 0;
                     {
@@ -1347,6 +1665,64 @@ void StreamWriter::setTrailer(const uint8_t* message, size_t size) {
 
 bool StreamReader::next(const uint8_t*& message, size_t& size) { return call_->session->readerNext(*call_, message, size); }
 
+namespace {
+Blob inlineBlobOf(detail::EndpointImpl& ep, const InboundMemory& memory, const uint8_t* data, size_t size) {
+    Blob blob;
+    blob.data = data;
+    blob.size = size;
+    if (size) {
+        ep.blobsInline.fetch_add(1, std::memory_order_relaxed);
+        if (memory.device)
+            blob.device = memory.device(memory.ctx, data);
+    }
+    return blob;
+}
+} // namespace
+
+Blob ServerContext::blob(uint32_t field, const uint8_t* inlineData, size_t inlineSize) const {
+    if (const detail::BlobLease* lease = call_->blobs.find(field))
+        return detail::leaseBlob(*lease);
+    return inlineBlobOf(*call_->owner, call_->session->inboundMemory(), inlineData, inlineSize);
+}
+
+bool StreamReader::currentBlob(uint32_t field, Blob& out) const {
+    const detail::BlobLease* lease = call_->current.leases.find(field);
+    if (!lease)
+        return false;
+    out = detail::leaseBlob(*lease);
+    return true;
+}
+
+Blob StreamReader::inlineBlob(const uint8_t* data, size_t size) const {
+    return inlineBlobOf(*call_->owner, call_->session->inboundMemory(), data, size);
+}
+
+detail::TakenItem* StreamReader::takeCurrent() { return call_->session->takeCurrent(*call_); }
+
+namespace detail {
+
+bool takenBlob(const TakenItem* item, uint32_t field, Blob& out) {
+    const BlobLease* lease = item->leases.find(field);
+    if (!lease)
+        return false;
+    out = leaseBlob(*lease);
+    return true;
+}
+
+Blob takenInline(const TakenItem* item, const uint8_t* data, size_t size) {
+    return inlineBlobOf(*item->owner, item->session->inboundMemory(), data, size);
+}
+
+void releaseTaken(TakenItem* item) noexcept {
+    // The blocks go back to the client now, from whichever thread this is.
+    std::shared_ptr<Session> session = std::move(item->session);
+    session->dropLeases(item->leases, true);
+    item->frame.reset();
+    item->owner->recycleTaken(item);
+}
+
+} // namespace detail
+
 bool StreamWriter::send(const uint8_t* message, size_t size) { return call_->session->streamSend(*call_, message, size); }
 
 // --- Registry ---------------------------------------------------------------------------------------------
@@ -1415,6 +1791,10 @@ Endpoint::Stats Endpoint::stats() const {
     out.calls = impl_->calls.load();
     out.failed = impl_->failed.load();
     out.rejected = impl_->rejected.load();
+    out.blobsShared = impl_->blobsShared.load();
+    out.blobsInline = impl_->blobsInline.load();
+    out.arenas = impl_->arenaAccount->arenas.load();
+    out.arenaBytes = impl_->arenaAccount->bytes.load();
     return out;
 }
 

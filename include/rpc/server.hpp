@@ -34,12 +34,14 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "bufs/bufs.hpp"
 #include "rpc/memory.hpp"
 #include "http/server.hpp"
+#include "rpc/shared.hpp"
 #include "rpc/span.hpp"
 #include "rpc/status.hpp"
 
@@ -48,6 +50,10 @@ namespace rpc {
 namespace detail {
 class Session;
 struct ServerCall;
+struct TakenItem;
+bool takenBlob(const TakenItem* item, uint32_t field, Blob& out);
+Blob takenInline(const TakenItem* item, const uint8_t* data, size_t size);
+void releaseTaken(TakenItem* item) noexcept;
 struct EndpointImpl;
 class LocalServerLink;
 } // namespace detail
@@ -111,6 +117,17 @@ public:
     std::shared_ptr<T> sessionState() const {
         return std::static_pointer_cast<T>(sessionState());
     }
+
+    /// The `(shared)` field `field` (the rpcc constant <Table>Shared::<name>) of this call's request: the bytes in the
+    /// client's shared area when the client sent them by reference, else `inlineBytes`, the field as it arrived in the
+    /// message (with Blob::device filled when it landed in memory that EndpointOptions::inboundMemory can translate).
+    /// Valid for the handler call. A shared blob is opaque and may change while you read it: see rpc/shared.hpp.
+    template <class T>
+    Blob blob(uint32_t field, bufs::Vector<T> inlineBytes) const {
+        static_assert(sizeof(T) == 1, "a shared field is a [ubyte] or [byte]");
+        return blob(field, reinterpret_cast<const uint8_t*>(inlineBytes.data()), inlineBytes.size());
+    }
+    Blob blob(uint32_t field, const uint8_t* inlineData, size_t inlineSize) const;
 
 private:
     detail::ServerCall* call_;
@@ -180,9 +197,60 @@ public:
     /// (cancelled, deadline, connection closed). `message` stays valid until the next call. Reading is what lets the
     /// client send more: the window it may fill is replenished as items are read.
     bool next(const uint8_t*& message, size_t& size);
+    /// The current item's blob in the shared area named by `field`; false if the client sent that field inline.
+    bool currentBlob(uint32_t field, Blob& out) const;
+    /// An inline field of the current item as a Blob (device filled when the item's memory is translatable).
+    Blob inlineBlob(const uint8_t* data, size_t size) const;
+    /// Moves the current item out (see ServerReader::take). Null when there is none.
+    detail::TakenItem* takeCurrent();
 
 private:
     detail::ServerCall* call_;
+};
+
+/// An item of the client's stream that outlives the next next(): its frame and its blobs. Move-only; everything is
+/// released when it is destroyed, on any thread (the blocks of the shared area go back to the client then).
+template <class T>
+class Taken {
+public:
+    Taken() = default;
+    ~Taken() { reset(); }
+    Taken(Taken&& other) noexcept : item_(std::exchange(other.item_, nullptr)), reader_(other.reader_) {}
+    Taken& operator=(Taken&& other) noexcept {
+        if (this != &other) {
+            reset();
+            item_ = std::exchange(other.item_, nullptr);
+            reader_ = other.reader_;
+        }
+        return *this;
+    }
+    Taken(const Taken&) = delete;
+    Taken& operator=(const Taken&) = delete;
+
+    explicit operator bool() const noexcept { return item_ != nullptr; }
+    const typename T::Reader& reader() const { return reader_; }
+    const typename T::Reader* operator->() const { return &reader_; }
+    /// A shared field of the item (see ServerReader::blob).
+    Blob blob(uint32_t field) const {
+        Blob out;
+        if (detail::takenBlob(item_, field, out))
+            return out;
+        const bufs::Vector<uint8_t> bytes(bufs::detail::readRef(reader_.bufsTable(), field));
+        return detail::takenInline(item_, bytes.data(), bytes.size());
+    }
+
+private:
+    template <class>
+    friend class ServerReader;
+    Taken(detail::TakenItem* item, const typename T::Reader& reader) : item_(item), reader_(reader) {}
+    void reset() noexcept {
+        if (item_)
+            detail::releaseTaken(item_);
+        item_ = nullptr;
+    }
+
+    detail::TakenItem* item_ = nullptr;
+    typename T::Reader reader_;
 };
 
 /// Items of table T from the client:  `while (in.next()) use(in->field());`
@@ -204,6 +272,24 @@ public:
     }
     const typename T::Reader& reader() const { return reader_; }
     const typename T::Reader* operator->() const { return &reader_; }
+
+    /// The `(shared)` field `field` (<Table>Shared::<name>) of the current item: in the client's shared area, or
+    /// inline when the client sent it that way. Valid until the next next().
+    Blob blob(uint32_t field) const {
+        Blob out;
+        if (in_->currentBlob(field, out))
+            return out;
+        const bufs::Vector<uint8_t> bytes(bufs::detail::readRef(reader_.bufsTable(), field));
+        return in_->inlineBlob(bytes.data(), bytes.size());
+    }
+
+    /// Moves the current item -- its frame and its blobs -- out of the reader, so that it outlives the next next().
+    /// The flow-control credit for the item is already given, as for any item read. Release the Taken (on any thread)
+    /// when done: the client cannot reuse the blocks until then.
+    Taken<T> take() {
+        detail::TakenItem* item = in_->takeCurrent();
+        return item ? Taken<T>(item, reader_) : Taken<T>();
+    }
 
 private:
     StreamReader* in_;
@@ -238,6 +324,10 @@ struct Method {
     bool inlineHint = false;
     uint32_t requestType = 0;        ///< the request table's bufs type id
     bool (*verifyRequest)(const void*, size_t) = nullptr;
+    /// Bit i set: slot i of the request table is a `(shared)` field, which a client may send by reference. Same for
+    /// the items of a client stream. Generated; a method without them refuses blobs.
+    uint64_t sharedFields = 0;
+    uint64_t itemSharedFields = 0;
     /// Unary: fills `response`; a non-Ok status (or a thrown rpc::Error) ends the call without a response.
     std::function<Status(ServerContext&, const uint8_t* request, size_t size, bufs::MessageBuilder& response)> unary;
     /// Server streaming: writes items to `writer`; the returned status ends the stream.
@@ -372,6 +462,25 @@ public:
         inboundMemory_ = memory;
         return *this;
     }
+    /// Local connections: offer each client a shared area of up to `maxBytesPerSession` for blobs (rpc/shared.hpp). The
+    /// server maps it read-only. 0, the default, offers none and clients send those fields inline.
+    EndpointOptions& sharedArena(uint64_t maxBytesPerSession) {
+        sharedArena_ = maxBytesPerSession;
+        return *this;
+    }
+    /// A cap on the shared areas of all sessions together; a client asking beyond it goes on without one. Registration
+    /// pins memory, so this is what bounds it. 0 = no cap.
+    EndpointOptions& sharedArenaTotal(uint64_t maxBytes) {
+        sharedArenaTotal_ = maxBytes;
+        return *this;
+    }
+    /// Called once per accepted shared area (the whole area), undone when the session and every blob lease into it are
+    /// gone: for cudaHostRegister. Blob::device is the registration's address plus the blob's offset. The callbacks'
+    /// context must outlive the endpoint and every Taken.
+    EndpointOptions& sharedRegistration(DeviceRegistration registration) {
+        sharedRegistration_ = registration;
+        return *this;
+    }
     /// Largest WebSocket message either way; 0 = the http::Server's maxWebSocketMessageBytes.
     EndpointOptions& maxMessage(size_t bytes) {
         maxMessage_ = bytes;
@@ -421,6 +530,9 @@ private:
     std::function<void(uint64_t, std::shared_ptr<void>)> onSessionClose_;
     size_t window_ = 1 << 20;
     InboundMemory inboundMemory_;
+    uint64_t sharedArena_ = 0;
+    uint64_t sharedArenaTotal_ = 0;
+    DeviceRegistration sharedRegistration_;
     size_t maxMessage_ = 0;
     std::chrono::seconds idleTimeout_{300};
     std::chrono::seconds stallTimeout_{30};
@@ -471,6 +583,10 @@ public:
         uint64_t calls = 0;         ///< calls started
         uint64_t failed = 0;        ///< ended with a status other than Ok
         uint64_t rejected = 0;      ///< refused before a handler ran (unknown method, bad request, overload)
+        uint64_t blobsShared = 0;   ///< blobs received by reference
+        uint64_t blobsInline = 0;   ///< shared fields a handler asked for that arrived inline (non-empty)
+        uint64_t arenas = 0;        ///< shared areas mapped now
+        uint64_t arenaBytes = 0;    ///< their total size
     };
     Stats stats() const;
 

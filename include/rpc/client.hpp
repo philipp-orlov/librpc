@@ -27,6 +27,7 @@
 #include "bufs/bufs.hpp"
 #include "rpc/detail/block.hpp"
 #include "rpc/memory.hpp"
+#include "rpc/shared.hpp"
 #include "rpc/span.hpp"
 #include "rpc/status.hpp"
 
@@ -80,6 +81,13 @@ struct ClientOptions {
     InboundMemory inboundMemory;
     /// Largest WebSocket message we accept; the server may choose less.
     size_t maxMessage = 16 << 20;
+    /// unix:// only: the size of the shared area this connection asks the server for, in bytes (rounded up to a page; the
+    /// server may offer less: EndpointOptions::sharedArena). 0, the default, asks for none. With one,
+    /// Client::allocateShared() hands out blocks of it and a call passes them to the server by reference. Size it to
+    /// the bulk data you keep in flight (several frames).
+    uint64_t sharedArenaBytes = 0;
+    /// Registers the shared area with a device on this side too (a client that fills blobs with a GPU kernel).
+    DeviceRegistration sharedRegistration;
     /// wss:// : the file with the CA certificates to trust (empty = the system's), and the test-only escape.
     std::string caFile;
     bool insecureSkipVerify = false;
@@ -109,7 +117,9 @@ public:
     /// Client streaming and bidirectional calls: sends one item (a finished message of the method's item type),
     /// waiting while the server has not read enough of what was sent. False: the call is over (the server answered,
     /// or it was cancelled); there is nothing to send to. Thread-safe against next() on another thread.
-    bool send(const uint8_t* message, size_t size);
+    /// `shares` (up to kMaxBlobsPerMessage) are SharedBuffers of Client::allocateShared() that travel by reference: the
+    /// item leaves those `(shared)` fields empty. They are consumed only when this returns true.
+    bool send(const uint8_t* message, size_t size, Share* shares = nullptr, size_t shareCount = 0);
     /// Says that no more items will be sent. Idempotent.
     void closeSend();
     /// Client streaming: closeSend(), waits for the server's answer and returns it (the response message); throws
@@ -205,6 +215,19 @@ public:
         return raw_.send(sealed.first, sealed.second);
     }
     bool write(const bufs::Message& item) { return raw_.send(item.data(), item.size()); }
+    /// ... with blobs: the item's `(shared)` fields named by the shares (<Table>Shared::<field>) travel by reference.
+    /// Each share's buffer must come from Client::allocateShared() and be shared() (check it, and fill the field
+    /// inline otherwise).
+    template <class Fill, class... S, class = std::enable_if_t<(sizeof...(S) > 0)>>
+    bool write(Fill&& fill, S&&... shares) {
+        static_assert((std::is_same_v<std::decay_t<S>, Share> && ...), "pass rpc::Share{slot, std::move(buffer)}");
+        Share items[] = {std::move(shares)...};
+        bufs::MessageBuilder builder;
+        typename Item::Builder root = builder.template initRoot<Item>();
+        fill(root);
+        const auto sealed = builder.finish();
+        return raw_.send(sealed.first, sealed.second, items, sizeof...(S));
+    }
 
     /// Says there are no more items, waits for the answer and returns it; throws rpc::Error if the call failed.
     Response<Resp> finish() { return Response<Resp>(raw_.finish()); }
@@ -231,6 +254,17 @@ public:
         return this->raw_.send(sealed.first, sealed.second);
     }
     bool write(const bufs::Message& item) { return this->raw_.send(item.data(), item.size()); }
+    /// ... with blobs, see ClientUpload::write.
+    template <class Fill, class... S, class = std::enable_if_t<(sizeof...(S) > 0)>>
+    bool write(Fill&& fill, S&&... shares) {
+        static_assert((std::is_same_v<std::decay_t<S>, Share> && ...), "pass rpc::Share{slot, std::move(buffer)}");
+        Share items[] = {std::move(shares)...};
+        bufs::MessageBuilder builder;
+        typename Item::Builder root = builder.template initRoot<Item>();
+        fill(root);
+        const auto sealed = builder.finish();
+        return this->raw_.send(sealed.first, sealed.second, items, sizeof...(S));
+    }
     /// No more items from this side; the server's stream goes on until it ends.
     void closeSend() { this->raw_.closeSend(); }
 };
@@ -290,12 +324,29 @@ public:
     /// ServerContext::onCancel hooks run). The connection stays usable.
     void cancelAll() noexcept;
 
-    /// Untyped calls: `request` is a finished message of the method's request type.
-    Payload call(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options = {});
+    /// A block of the connection's shared area (ClientOptions::sharedArenaBytes) to fill with bulk data and pass to a
+    /// call, or, when the connection has no area or it is full, a pooled buffer that travels inline
+    /// (SharedBuffer::shared() is false). Never blocks. Any thread.
+    SharedBuffer allocateShared(size_t bytes);
+
+    struct Stats {
+        uint64_t blobsShared = 0;  ///< blobs sent by reference
+        uint64_t blobsInline = 0;  ///< allocateShared() calls that fell back to a pooled buffer
+        uint64_t arenaBytes = 0;   ///< size of the shared area; 0 = none
+        uint64_t arenaInUse = 0;   ///< bytes of its blocks held by the application or not yet released by the server
+    };
+    Stats stats() const;
+
+    /// Untyped calls: `request` is a finished message of the method's request type. `shares` (up to
+    /// kMaxBlobsPerMessage, each a shared() buffer of allocateShared()) travel by reference; they are consumed.
+    /// A call that gives up (timeout, cancel) keeps their blocks until the server's End or the disconnect.
+    Payload call(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options = {},
+                 Share* shares = nullptr, size_t shareCount = 0);
     /// One-way: sends the call and does not wait for (or keep) the answer. False if it could not be sent. For
     /// calls whose outcome nobody needs, e.g. from a destructor.
     bool notify(uint32_t method, const uint8_t* request, size_t size) noexcept;
-    RawStream openStream(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options = {});
+    RawStream openStream(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options = {},
+                         Share* shares = nullptr, size_t shareCount = 0);
 
     /// Typed unary call: `fill(Req::Builder&)` builds the request.
     template <class Req, class Resp, class Fill>
@@ -305,6 +356,15 @@ public:
         fill(root);
         const auto sealed = builder.finish();
         return Response<Resp>(call(method, sealed.first, sealed.second, options));
+    }
+    /// ... with blobs (see call()).
+    template <class Req, class Resp, class Fill>
+    Response<Resp> unary(uint32_t method, Fill&& fill, const CallOptions& options, Share* shares, size_t shareCount) {
+        bufs::MessageBuilder builder;
+        typename Req::Builder root = builder.template initRoot<Req>();
+        fill(root);
+        const auto sealed = builder.finish();
+        return Response<Resp>(call(method, sealed.first, sealed.second, options, shares, shareCount));
     }
     template <class Resp>
     Response<Resp> unary(uint32_t method, const bufs::Message& request, const CallOptions& options = {}) {
@@ -322,6 +382,15 @@ public:
         return openStream(method, sealed.first, sealed.second, options);
     }
 
+    template <class Req, class Fill>
+    RawStream openCall(uint32_t method, Fill&& fill, const CallOptions& options, Share* shares, size_t shareCount) {
+        bufs::MessageBuilder builder;
+        typename Req::Builder root = builder.template initRoot<Req>();
+        fill(root);
+        const auto sealed = builder.finish();
+        return openStream(method, sealed.first, sealed.second, options, shares, shareCount);
+    }
+
     /// Typed server-streaming call.
     template <class Req, class Resp, class Fill>
     ClientStream<Resp> stream(uint32_t method, Fill&& fill, const CallOptions& options = {}) {
@@ -330,6 +399,14 @@ public:
         fill(root);
         const auto sealed = builder.finish();
         return ClientStream<Resp>(openStream(method, sealed.first, sealed.second, options));
+    }
+    template <class Req, class Resp, class Fill>
+    ClientStream<Resp> stream(uint32_t method, Fill&& fill, const CallOptions& options, Share* shares, size_t shareCount) {
+        bufs::MessageBuilder builder;
+        typename Req::Builder root = builder.template initRoot<Req>();
+        fill(root);
+        const auto sealed = builder.finish();
+        return ClientStream<Resp>(openStream(method, sealed.first, sealed.second, options, shares, shareCount));
     }
     template <class Resp>
     ClientStream<Resp> stream(uint32_t method, const bufs::Message& request, const CallOptions& options = {}) {

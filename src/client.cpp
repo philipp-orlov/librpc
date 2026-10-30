@@ -16,6 +16,7 @@
 #include "bufs/local.hpp"
 #include "bufs/shm.hpp"
 #include "http/websocket_client.hpp"
+#include "arena.hpp"
 #include "ipc_common.hpp"
 #include "rpc/detail/frame.hpp"
 #include "rpc/detail/link.hpp"
@@ -110,6 +111,7 @@ public:
                             path + " refused the connection (" + std::to_string(hello.status) + ")");
             if (fds.count != 1)
                 throw Error(Code::Unavailable, path + " sent no channel");
+            arenaMiB_ = hello.arenaMiB;
             channel_ = bufs::shm::Channel::adopt(fds.take(0), 1ull << 32);
         } catch (const std::system_error& error) {
             throw Error(error.code() == std::errc::permission_denied ? Code::PermissionDenied : Code::Unavailable,
@@ -177,6 +179,14 @@ public:
         socket_.shutdown();  // the server sees the connection end
     }
 
+    uint64_t offeredArenaMiB() const noexcept override { return arenaMiB_; }
+
+    void sendArena(uint64_t bytes, int fd) override {
+        IpcArena message;
+        message.bytes = bytes;
+        socket_.send(&message, sizeof message, &fd, 1);
+    }
+
 private:
     bool peerGone() {
         pollfd p{socket_.fd(), POLLRDHUP, 0};
@@ -187,6 +197,7 @@ private:
     bufs::shm::Channel channel_;
     std::chrono::nanoseconds spin_;
     InboundMemory memory_;
+    uint32_t arenaMiB_ = 0;
     std::mutex sendMutex_;
     std::atomic<bool> closed_{false};
 };
@@ -207,6 +218,11 @@ struct CallState {
     bool waiting = false;  // a thread sleeps on cv (guarded by mu)
     bool detached = false; // Client::notify: nobody waits; the End frees the slot
     bool sendClosed = false; // the caller finished its stream
+    // Blocks of the shared area the request went out with: the server may read them until its End. A call the caller
+    // gave up on (timeout, cancel) stays in the table, `abandoned`, until then.
+    uint64_t leases[kMaxBlobsPerMessage] = {};
+    uint8_t leaseCount = 0;
+    bool abandoned = false;
     Status status;
     Payload response;  // a unary call's response
     std::condition_variable cv;
@@ -265,6 +281,10 @@ struct ClientImpl {
     bool leaderMode = false;
     bool pumping = false;  // a thread is the leader right now
 
+    std::shared_ptr<ClientArena> arena;  // the shared area, if the server accepted one (fixed after connect)
+    std::atomic<uint64_t> blobsShared{0};
+    std::atomic<uint64_t> blobsInline{0};
+
     std::string serverName;
     uint64_t session = 0;
     size_t window = 0;
@@ -306,6 +326,10 @@ struct ClientImpl {
                 slot->ended = true;
                 slot->status = closeStatus;
             }
+            // The connection is gone, and with it the server's claim on the blocks.
+            releaseLeases(slot.get());
+            if (slot->abandoned)
+                freeSlot(slot.get());
             slot->cv.notify_all();
         }
     }
@@ -372,18 +396,37 @@ struct ClientImpl {
         state->detached = false;
         state->sendClosed = false;
         state->ended = false;
+        state->abandoned = false;
+        state->leaseCount = 0;
         state->status = Status();
         return state;
     }
 
-    // Frees the slot; returns the frame bytes of the items it still held.
+    // The call's blocks of the shared area go back (the server's End, or the link died).
+    void releaseLeases(CallState* state) noexcept {
+        for (uint8_t i = 0; i < state->leaseCount; ++i)
+            arena->releaseSent(state->leases[i]);
+        state->leaseCount = 0;
+    }
+
+    void freeSlot(CallState* state) {
+        const uint32_t slot = state->id & kSlotMask;
+        state->id = 0;
+        state->abandoned = false;
+        freeSlots.push_back(slot);
+    }
+
+    // The caller is done with the slot; returns the frame bytes of the items it still held. A slot whose request is
+    // still lent to the server stays (abandoned) until the server's End, so its blocks are not reused while it may
+    // read them.
     size_t release(CallState* state) {
         const size_t dropped = state->dropItems();
         state->response.reset();
         state->status = Status();
-        const uint32_t slot = state->id & kSlotMask;
-        state->id = 0;
-        freeSlots.push_back(slot);
+        if (state->leaseCount)
+            state->abandoned = true;
+        else
+            freeSlot(state);
         return dropped;
     }
 
@@ -482,14 +525,47 @@ struct ClientImpl {
         dispatch(inbound, frame);
     }
 
+    // ---- blobs ----
+
+    // The shares of a call or an item must be blocks of this connection's shared area that are still the caller's.
+    void checkShares(const Share* shares, size_t count) const {
+        if (count > kMaxBlobsPerMessage)
+            throw Error(Code::InvalidArgument, "a message carries at most 4 shared blobs");
+        for (size_t i = 0; i < count; ++i) {
+            if (!shares[i].buffer.shared() || shares[i].buffer.arena_.get() != arena.get())
+                throw Error(Code::InvalidArgument,
+                            "a share must be a shared() block of this connection's Client::allocateShared (fill the field inline otherwise)");
+            for (size_t j = 0; j < i; ++j)
+                if (shares[j].field == shares[i].field || shares[j].buffer.offset_ == shares[i].buffer.offset_)
+                    throw Error(Code::InvalidArgument, "a field is shared twice");
+        }
+    }
+
+    static void fillBlobs(wire::Envelope::Builder& e, size_t count, const uint32_t* fields, const uint64_t* offsets,
+                          const uint64_t* lengths) {
+        if (!count)
+            return;
+        auto list = e.initBlobs(count);
+        for (size_t i = 0; i < count; ++i) {
+            wire::BlobRef ref;
+            ref.field = fields[i];
+            ref.reserved = 0;
+            ref.offset = offsets[i];
+            ref.length = lengths[i];
+            list.set(i, ref);
+        }
+    }
+
     // ---- the caller's stream (client streaming and bidirectional calls) ----
 
     // Sends one item of call `id`'s stream, waiting while the server has not read enough of what is already sent.
     // False when the call is over (the server answered early, or it was cancelled).
-    bool sendItem(uint32_t id, const uint8_t* message, size_t size) {
+    bool sendItem(uint32_t id, const uint8_t* message, size_t size, Share* shares, size_t shareCount) {
         if (!size || bufs::typeOf(message, size) == 0 || (reinterpret_cast<uintptr_t>(message) & 7) != 0)
             throw Error(Code::InvalidArgument, "a stream item is not a finished, 8-aligned message");
-        const size_t frameBytes = 64 + size;  // an envelope of this kind is under 64 bytes
+        checkShares(shares, shareCount);
+        // An envelope of this kind is under 64 bytes, plus its blob list.
+        const size_t frameBytes = 64 + (shareCount ? 8 + shareCount * sizeof(wire::BlobRef) : 0) + size;
         if (serverMaxMessage && frameBytes > serverMaxMessage + 64)
             throw Error(Code::ResourceExhausted, "stream item exceeds the server's maximum message size");
         {
@@ -507,19 +583,31 @@ struct ClientImpl {
                 return false;
             sendUnacked += frameBytes;
         }
+        uint64_t sent[kMaxBlobsPerMessage] = {};
+        uint32_t fields[kMaxBlobsPerMessage] = {};
+        uint64_t lengths[kMaxBlobsPerMessage] = {};
         try {
+            for (size_t i = 0; i < shareCount; ++i) {
+                fields[i] = shares[i].field;
+                lengths[i] = shares[i].buffer.size();
+                sent[i] = shares[i].buffer.markSent();
+            }
             const auto env = envelope([&](wire::Envelope::Builder& e) {
                 e.setId(id);
                 e.setKind(wire::Kind::Data);
+                fillBlobs(e, shareCount, fields, sent, lengths);
             });
-            // The server counts the whole frame it receives; ours is envelope + item, a few bytes under the 64 booked.
+            // The server counts the whole frame it receives; ours is envelope + item, a few bytes under what was booked.
             const size_t actual = env.second + size;
             if (actual < frameBytes) {
                 std::lock_guard<std::mutex> lock(mu);
                 sendUnacked -= std::min<uint64_t>(sendUnacked, frameBytes - actual);
             }
             send(env, message, size);
+            blobsShared.fetch_add(shareCount, std::memory_order_relaxed);
         } catch (const LinkError& error) {
+            for (size_t i = 0; i < shareCount; ++i)
+                arena->releaseSent(sent[i]);
             throw Error(Code::Unavailable, std::string("connection lost: ") + error.what());
         }
         return true;
@@ -610,6 +698,11 @@ struct ClientImpl {
             CallState* state = find(env.id());
             if (!state)
                 return;
+            releaseLeases(state);  // the server is done with the request's blobs
+            if (state->abandoned) {  // the caller left long ago
+                freeSlot(state);
+                return;
+            }
             if (state->detached) {  // a one-way call: the answer is not wanted
                 release(state);
                 return;
@@ -636,14 +729,21 @@ struct ClientImpl {
                 closeStatus = Status(Code::Unavailable, "server is shutting down");
             return;
         }
+        case wire::Kind::Release: {  // blocks of the shared area the server is done with (stream items)
+            if (arena)
+                for (const wire::BlobRef& blob : env.blobs())
+                    arena->releaseSent(blob.offset);
+            return;
+        }
         default: return;
         }
     }
 
     CallState* start(uint32_t method, const uint8_t* request, size_t size, const CallOptions& callOptions, bool stream,
-                     bool detached = false) {
+                     bool detached = false, Share* shares = nullptr, size_t shareCount = 0) {
         if (!size || bufs::typeOf(request, size) == 0 || (reinterpret_cast<uintptr_t>(request) & 7) != 0)
             throw Error(Code::InvalidArgument, "request is not a finished, 8-aligned message");
+        checkShares(shares, shareCount);
         CallState* state;
         uint32_t id;
         {
@@ -656,21 +756,62 @@ struct ClientImpl {
             state->detached = detached;  // before the frame goes out: the answer may come at once
             id = state->id;
         }
+        uint32_t fields[kMaxBlobsPerMessage] = {};
+        uint64_t offsets[kMaxBlobsPerMessage] = {};
+        uint64_t lengths[kMaxBlobsPerMessage] = {};
+        size_t marked = 0;
+        // Blocks that were marked sent but never went out come back to the application's pool.
+        const auto takeBack = [&] {
+            for (size_t i = 0; i < marked; ++i)
+                arena->releaseSent(offsets[i]);
+            marked = 0;
+        };
         try {
-            const auto env = envelope([&](wire::Envelope::Builder& e) {
-                e.setId(id);
-                e.setKind(wire::Kind::Call);
-                e.setMethod(method);
-                if (callOptions.timeout.count() > 0)
-                    e.setDeadlineMs(static_cast<uint32_t>(std::min<int64_t>(callOptions.timeout.count(), UINT32_MAX)));
-            });
-            if (serverMaxMessage && env.second + size > serverMaxMessage)
+            for (size_t i = 0; i < shareCount; ++i) {
+                fields[i] = shares[i].field;
+                lengths[i] = shares[i].buffer.size();
+            }
+            const auto build = [&] {
+                return envelope([&](wire::Envelope::Builder& e) {
+                    e.setId(id);
+                    e.setKind(wire::Kind::Call);
+                    e.setMethod(method);
+                    if (callOptions.timeout.count() > 0)
+                        e.setDeadlineMs(static_cast<uint32_t>(std::min<int64_t>(callOptions.timeout.count(), UINT32_MAX)));
+                    fillBlobs(e, shareCount, fields, offsets, lengths);
+                });
+            };
+            // The envelope's size does not depend on the offsets: measure it before the blocks are committed.
+            if (serverMaxMessage && build().second + size > serverMaxMessage)
                 throw Error(Code::ResourceExhausted, "request exceeds the server's maximum message size");
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                for (size_t i = 0; i < shareCount; ++i) {
+                    offsets[i] = shares[i].buffer.markSent();
+                    state->leases[i] = offsets[i];
+                    ++marked;
+                }
+                state->leaseCount = static_cast<uint8_t>(shareCount);
+            }
+            const auto env = build();
             send(env, request, size);
+            blobsShared.fetch_add(shareCount, std::memory_order_relaxed);
         } catch (const LinkError& error) {
+            takeBack();
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                if (find(id) == state)
+                    state->leaseCount = 0;
+            }
             cancelCall(id, false);
             throw Error(Code::Unavailable, std::string("connection lost: ") + error.what());
         } catch (...) {
+            takeBack();
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                if (find(id) == state)
+                    state->leaseCount = 0;
+            }
             cancelCall(id, false);
             throw;
         }
@@ -692,8 +833,25 @@ Client Client::connect(std::string_view url, const ClientOptions& options) {
     else
         impl->link = std::make_unique<detail::WebSocketClientLink>(url, options, options.maxMessage);
     try {
+        // A shared area for blobs: created and handed over before the Hello that announces it.
+        std::shared_ptr<detail::ClientArena> arena;
+        if (local && options.sharedArenaBytes > 0) {
+            const uint64_t offered = impl->link->offeredArenaMiB() << 20;
+            if (offered > 0) {
+                const uint64_t bytes = std::min(options.sharedArenaBytes, offered);
+                try {
+                    arena = detail::ClientArena::create(bytes, options.sharedRegistration);
+                    impl->link->sendArena(arena->bytes(), arena->fd());
+                } catch (const std::system_error&) {
+                    arena.reset();  // no memfd, or the socket refused it: go on without
+                }
+            }
+        }
+        const uint64_t announced = arena ? arena->bytes() : 0;
         impl->send(detail::envelope([&](wire::Envelope::Builder& e) {
             e.setKind(wire::Kind::Hello);
+            if (announced)
+                e.setArena(announced);
             e.setProtocol(detail::kProtocol);
             e.setPeer(options.peer);
             if (!options.token.empty())
@@ -713,6 +871,8 @@ Client Client::connect(std::string_view url, const ClientOptions& options) {
             throw Error(static_cast<Code>(env.code()), std::string(env.message()), env.detail());
         if (env.kind() != wire::Kind::Welcome)
             throw Error(Code::DataLoss, "expected Welcome");
+        if (arena && env.arena() == announced)
+            impl->arena = std::move(arena);  // otherwise the server refused it: the area is unmapped here
         impl->serverName = std::string(env.peer());
         impl->session = env.session();
         if (env.window())
@@ -782,11 +942,12 @@ void Client::close() noexcept {
         impl_->close();
 }
 
-Payload Client::call(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options) {
+Payload Client::call(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options, Share* shares,
+                     size_t shareCount) {
     if (!impl_)
         throw Error(Code::FailedPrecondition, "client is not connected");
     const auto deadline = options.timeout.count() > 0 ? Clock::now() + options.timeout : Clock::time_point::max();
-    detail::CallState* state = impl_->start(method, request, size, options, false);
+    detail::CallState* state = impl_->start(method, request, size, options, false, false, shares, shareCount);
     const uint32_t id = state->id;
     std::unique_lock<std::mutex> lock(impl_->mu);
     const auto ready = [&] { return state->id != id || state->ended; };
@@ -819,12 +980,86 @@ bool Client::notify(uint32_t method, const uint8_t* request, size_t size) noexce
     }
 }
 
-RawStream Client::openStream(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options) {
+RawStream Client::openStream(uint32_t method, const uint8_t* request, size_t size, const CallOptions& options, Share* shares,
+                             size_t shareCount) {
     if (!impl_)
         throw Error(Code::FailedPrecondition, "client is not connected");
     const auto deadline = options.timeout.count() > 0 ? Clock::now() + options.timeout : Clock::time_point::max();
-    detail::CallState* state = impl_->start(method, request, size, options, true);
+    detail::CallState* state = impl_->start(method, request, size, options, true, false, shares, shareCount);
     return RawStream(impl_, state->id, deadline);
+}
+
+// --- shared blobs ---------------------------------------------------------------------------------------------
+
+SharedBuffer Client::allocateShared(size_t bytes) {
+    SharedBuffer buffer;
+    if (impl_ && impl_->arena) {
+        uint64_t offset = 0;
+        if (impl_->arena->allocate(bytes, offset)) {
+            buffer.arena_ = impl_->arena;
+            buffer.offset_ = offset;
+            buffer.data_ = impl_->arena->base() + offset;
+            buffer.size_ = bytes;
+            return buffer;
+        }
+    }
+    buffer.pooled_ = bufs::BufferPool::global().acquire(bytes ? bytes : 1);
+    buffer.data_ = buffer.pooled_.data();
+    buffer.size_ = bytes;
+    if (impl_)
+        impl_->blobsInline.fetch_add(1, std::memory_order_relaxed);
+    return buffer;
+}
+
+Client::Stats Client::stats() const {
+    Stats out;
+    if (!impl_)
+        return out;
+    out.blobsShared = impl_->blobsShared.load(std::memory_order_relaxed);
+    out.blobsInline = impl_->blobsInline.load(std::memory_order_relaxed);
+    if (impl_->arena) {
+        out.arenaBytes = impl_->arena->bytes();
+        out.arenaInUse = impl_->arena->inUse();
+    }
+    return out;
+}
+
+SharedBuffer::~SharedBuffer() { reset(); }
+
+SharedBuffer::SharedBuffer(SharedBuffer&& other) noexcept
+    : arena_(std::move(other.arena_)), offset_(other.offset_), data_(std::exchange(other.data_, nullptr)),
+      size_(std::exchange(other.size_, 0)), pooled_(std::move(other.pooled_)) {}
+
+SharedBuffer& SharedBuffer::operator=(SharedBuffer&& other) noexcept {
+    if (this != &other) {
+        reset();
+        arena_ = std::move(other.arena_);
+        offset_ = other.offset_;
+        data_ = std::exchange(other.data_, nullptr);
+        size_ = std::exchange(other.size_, 0);
+        pooled_ = std::move(other.pooled_);
+    }
+    return *this;
+}
+
+const void* SharedBuffer::device() const noexcept { return arena_ ? arena_->device(offset_) : nullptr; }
+
+uint64_t SharedBuffer::markSent() noexcept {
+    const uint64_t offset = offset_;
+    arena_->markSent(offset);
+    arena_.reset();
+    data_ = nullptr;
+    size_ = 0;
+    return offset;
+}
+
+void SharedBuffer::reset() noexcept {
+    if (arena_)
+        arena_->releaseHeld(offset_);
+    arena_.reset();
+    pooled_.reset();
+    data_ = nullptr;
+    size_ = 0;
 }
 
 // --- RawStream ------------------------------------------------------------------------------------------------
@@ -851,10 +1086,10 @@ void RawStream::cancel() noexcept {
     id_ = 0;
 }
 
-bool RawStream::send(const uint8_t* message, size_t size) {
+bool RawStream::send(const uint8_t* message, size_t size, Share* shares, size_t shareCount) {
     if (!impl_ || !id_)
         return false;
-    return impl_->sendItem(id_, message, size);
+    return impl_->sendItem(id_, message, size, shares, shareCount);
 }
 
 void RawStream::closeSend() {

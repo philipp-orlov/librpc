@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "bufs/bufs.hpp"
+#include "bufs/fd.hpp"
 #include "rpc/detail/block.hpp"
 
 namespace rpc::detail {
@@ -43,6 +44,13 @@ public:
     virtual void close() noexcept = 0;
     /// The largest frame the link can carry, or 0 for no limit of its own.
     virtual size_t maxFrame() const noexcept { return 0; }
+    /// Local links: the largest shared area, in MiB, the server accepts; 0 = none offered (and always 0 elsewhere).
+    virtual uint64_t offeredArenaMiB() const noexcept { return 0; }
+    /// Local links: hands the server a shared area (a sealed memfd of `bytes`) before the Hello that announces it.
+    virtual void sendArena(uint64_t bytes, int fd) {
+        (void)bytes;
+        (void)fd;
+    }
 };
 
 /// The server's end of one connection. The protocol core (Session) calls these; the transport calls the
@@ -62,6 +70,14 @@ public:
     /// True when frames arrive on a thread of the link's own that may run a short handler (IPC); a WebSocket's
     /// frames arrive on a shared I/O thread, which must never.
     virtual bool dedicatedReader() const noexcept { return false; }
+    /// Local links: takes, without blocking, the shared area the client sent before its Hello (the memfd), after
+    /// checking that it announced `bytes`. False when there is none or it is malformed (the fd is closed). Links that
+    /// cannot carry one -- a WebSocket -- always say false.
+    virtual bool takeArena(uint64_t bytes, bufs::Fd& fd) {
+        (void)bytes;
+        (void)fd;
+        return false;
+    }
 };
 
 } // namespace rpc::detail

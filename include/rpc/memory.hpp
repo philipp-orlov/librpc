@@ -25,6 +25,8 @@
 #include <mutex>
 #include <vector>
 
+#include "rpc/shared.hpp"
+
 namespace rpc {
 
 /// Caller-supplied memory for received frames. A frame is the envelope followed by the message, so a message
@@ -38,6 +40,9 @@ struct InboundMemory {
     /// is gone, so `ctx` must outlive every message.
     void (*release)(void* ctx, void* data, size_t bytes) = nullptr;
     void* ctx = nullptr;
+    /// Optional: where a device reads the byte at `host`, which lies in a block allocate() returned (PinnedPool
+    /// fills it in); nullptr when it does not know. Lets a handler ask for the device address of an inline field.
+    const void* (*device)(void* ctx, const void* host) = nullptr;
 
     explicit operator bool() const noexcept { return allocate != nullptr && release != nullptr; }
 };
@@ -47,29 +52,31 @@ struct InboundMemory {
 /// pool is destroyed, so the steady state has no allocation, no registration and no fragmentation.
 ///
 /// CUDA:
-///   PinnedPool pool({[](void*, void* p, size_t n) { return cudaHostRegister(p, n, cudaHostRegisterDefault) == cudaSuccess; },
+///   PinnedPool pool({[](void*, void* p, size_t n) { return cudaHostRegister(p, n, cudaHostRegisterDefault) == cudaSuccess ? p : nullptr; },
 ///                    [](void*, void* p, size_t) { cudaHostUnregister(p); }, nullptr});
 ///   clientOptions.inboundMemory = pool.memory();
+///
+/// The registration returns the address the device reads the block at (the block's own address where addressing is
+/// unified; on Tegra it may differ). PinnedPool remembers it per block: device() translates.
 ///
 /// The pool must outlive every message received through it.
 class PinnedPool {
 public:
-    struct Registration {
-        /// Registers [data, data + bytes); false = it could not be (that frame falls back to librpc's own pool).
-        bool (*registerMemory)(void* ctx, void* data, size_t bytes) = nullptr;
-        /// Undoes it. Called for every registered block when the pool is destroyed.
-        void (*unregisterMemory)(void* ctx, void* data, size_t bytes) = nullptr;
-        void* ctx = nullptr;
-    };
-
     PinnedPool() = default;
-    explicit PinnedPool(Registration registration);
+    /// A non-null result of registerMemory is the block's device address; nullptr = it could not be registered (that
+    /// frame falls back to librpc's own pool). unregisterMemory is called for every registered block when the pool
+    /// is destroyed.
+    explicit PinnedPool(DeviceRegistration registration);
     ~PinnedPool();
     PinnedPool(const PinnedPool&) = delete;
     PinnedPool& operator=(const PinnedPool&) = delete;
 
     /// The allocate/release pair that serves from this pool.
     InboundMemory memory() noexcept;
+
+    /// The device address of the byte at `host`, which lies inside one of this pool's blocks; nullptr when it does
+    /// not, or the pool has no registration.
+    const void* device(const void* host) const;
 
     /// Blocks created so far, their total bytes, and how many are out right now.
     size_t blocks() const;
@@ -80,14 +87,19 @@ private:
     static constexpr size_t kMinShift = 12;  // 4 KiB
     static constexpr size_t kClasses = 53;
 
+    struct BlockInfo {
+        uintptr_t host;
+        size_t bytes;
+        void* device;
+    };
+
     void* take(size_t bytes);
     void give(void* data, size_t bytes);
 
-    Registration registration_;
+    DeviceRegistration registration_;
     mutable std::mutex mutex_;
     std::vector<void*> free_[kClasses];
-    std::vector<void*> all_;  // every block, with its class size, for the destructor
-    std::vector<size_t> allSizes_;
+    std::vector<BlockInfo> all_;  // every block, sorted by host address (grows only when the pool does)
     std::atomic<size_t> inUse_{0};
 };
 
