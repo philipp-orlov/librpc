@@ -19,6 +19,29 @@ class Kind(_IntEnum):
     Pong = 9
     Goodbye = 10
     Closing = 11
+    Release = 12
+
+
+class BlobRef(Struct):
+    """One shared field of the message that follows the envelope (local sockets only; see the README)."""
+    SIZE = 24
+    __slots__ = ('field', 'reserved', 'offset', 'length', )
+
+    def __init__(self, field=None, reserved=None, offset=None, length=None):
+        self.field = 0 if field is None else field
+        self.reserved = 0 if reserved is None else reserved
+        self.offset = 0 if offset is None else offset
+        self.length = 0 if length is None else length
+
+    @classmethod
+    def _read(cls, buf, at):
+        return cls(field=_struct.unpack_from('<I', buf, at + 0)[0], reserved=_struct.unpack_from('<I', buf, at + 4)[0], offset=_struct.unpack_from('<Q', buf, at + 8)[0], length=_struct.unpack_from('<Q', buf, at + 16)[0])
+
+    def _write(self, buf, at):
+        _struct.pack_into('<I', buf, at + 0, self.field)
+        _struct.pack_into('<I', buf, at + 4, self.reserved)
+        _struct.pack_into('<Q', buf, at + 8, self.offset)
+        _struct.pack_into('<Q', buf, at + 16, self.length)
 
 
 class Envelope:
@@ -101,6 +124,14 @@ class Envelope:
     def detail(self):
         return self._t.u32(56, 0)
 
+    @property
+    def blobs(self):
+        return read_structs(self._t, 3, 24, BlobRef._read)
+
+    @property
+    def arena(self):
+        return self._t.u64(64, 0)
+
     def to_dict(self):
         """The fields as plain Python values (tables become dicts)."""
         d = {}
@@ -119,6 +150,8 @@ class Envelope:
         d['max_inflight'] = self.max_inflight
         d['credit'] = self.credit
         d['detail'] = self.detail
+        d['blobs'] = self.blobs
+        d['arena'] = self.arena
         return d
 
     def __repr__(self):
@@ -126,7 +159,7 @@ class Envelope:
 
 
 def _write_Envelope(mb, init):
-    t = mb.table(60, 3)
+    t = mb.table(72, 4)
     v = init.get('id')
     if v is not None:
         mb.set_u32(t + 4, v, 0)
@@ -141,7 +174,7 @@ def _write_Envelope(mb, init):
         mb.set_u16(t + 10, v, 0)
     v = init.get('message')
     if v is not None:
-        mb.set_ref(t, 60, 0, mb.string(v))
+        mb.set_ref(t, 72, 0, mb.string(v))
     v = init.get('deadline_ms')
     if v is not None:
         mb.set_u32(t + 16, v, 0)
@@ -150,10 +183,10 @@ def _write_Envelope(mb, init):
         mb.set_u16(t + 20, v, 0)
     v = init.get('peer')
     if v is not None:
-        mb.set_ref(t, 60, 1, mb.string(v))
+        mb.set_ref(t, 72, 1, mb.string(v))
     v = init.get('token')
     if v is not None:
-        mb.set_ref(t, 60, 2, mb.string(v))
+        mb.set_ref(t, 72, 2, mb.string(v))
     v = init.get('window')
     if v is not None:
         mb.set_u64(t + 24, v, 0)
@@ -172,6 +205,15 @@ def _write_Envelope(mb, init):
     v = init.get('detail')
     if v is not None:
         mb.set_u32(t + 56, v, 0)
+    v = init.get('blobs')
+    if v is not None:
+        vec = mb.vector(len(v), 24, 8)
+        for i, item in enumerate(v):
+            item._write(mb.buf, vec + 4 + i * 24)
+        mb.set_ref(t, 72, 3, vec)
+    v = init.get('arena')
+    if v is not None:
+        mb.set_u64(t + 64, v, 0)
     return t
 
 

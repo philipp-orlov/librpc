@@ -24,6 +24,37 @@ namespace Rpc.Wire
         Pong = 9,
         Goodbye = 10,
         Closing = 11,
+        Release = 12,
+    }
+
+    /// <summary>
+    /// One shared field of the message that follows the envelope (local sockets only; see the README).
+    /// </summary>
+    public struct BlobRef
+    {
+        public const int Size = 24;
+        public uint Field;
+        public uint Reserved;
+        public ulong Offset;
+        public ulong Length;
+
+        public static BlobRef Read(ReadOnlySpan<byte> s, int at)
+        {
+            var v = new BlobRef();
+            v.Field = BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(at + 0));
+            v.Reserved = BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(at + 4));
+            v.Offset = BinaryPrimitives.ReadUInt64LittleEndian(s.Slice(at + 8));
+            v.Length = BinaryPrimitives.ReadUInt64LittleEndian(s.Slice(at + 16));
+            return v;
+        }
+
+        public static void Write(Span<byte> s, int at, BlobRef v)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(s.Slice(at + 0), v.Field);
+            BinaryPrimitives.WriteUInt32LittleEndian(s.Slice(at + 4), v.Reserved);
+            BinaryPrimitives.WriteUInt64LittleEndian(s.Slice(at + 8), v.Offset);
+            BinaryPrimitives.WriteUInt64LittleEndian(s.Slice(at + 16), v.Length);
+        }
     }
 
     public sealed class EnvelopeInit
@@ -43,6 +74,8 @@ namespace Rpc.Wire
         public uint? MaxInflight;
         public ulong? Credit;
         public uint? Detail;
+        public global::Rpc.Wire.BlobRef[]? Blobs;
+        public ulong? Arena;
     }
 
     public readonly struct Envelope
@@ -67,7 +100,7 @@ namespace Rpc.Wire
         /// <summary>Writes <c>init</c> as a table of the message being built; returns the table's offset.</summary>
         public static int Write(MessageBuilder mb, EnvelopeInit init)
         {
-            int t = mb.NewTable(60, 3);
+            int t = mb.NewTable(72, 4);
             if (init.Id != null)
             {
                 mb.SetU32(t + 4, init.Id.Value, 0);
@@ -86,7 +119,7 @@ namespace Rpc.Wire
             }
             if (init.Message != null)
             {
-                mb.SetRef(t, 60, 0, mb.NewString(init.Message));
+                mb.SetRef(t, 72, 0, mb.NewString(init.Message));
             }
             if (init.DeadlineMs != null)
             {
@@ -98,11 +131,11 @@ namespace Rpc.Wire
             }
             if (init.Peer != null)
             {
-                mb.SetRef(t, 60, 1, mb.NewString(init.Peer));
+                mb.SetRef(t, 72, 1, mb.NewString(init.Peer));
             }
             if (init.Token != null)
             {
-                mb.SetRef(t, 60, 2, mb.NewString(init.Token));
+                mb.SetRef(t, 72, 2, mb.NewString(init.Token));
             }
             if (init.Window != null)
             {
@@ -127,6 +160,19 @@ namespace Rpc.Wire
             if (init.Detail != null)
             {
                 mb.SetU32(t + 56, init.Detail.Value, 0);
+            }
+            if (init.Blobs != null)
+            {
+                int vector = mb.NewVector(init.Blobs.Length, 24, 8);
+                for (int i = 0; i < init.Blobs.Length; i++)
+                {
+                    global::Rpc.Wire.BlobRef.Write(mb.Span, vector + 4 + i * 24, init.Blobs[i]);
+                }
+                mb.SetRef(t, 72, 3, vector);
+            }
+            if (init.Arena != null)
+            {
+                mb.SetU64(t + 64, init.Arena.Value, 0);
             }
             return t;
         }
@@ -163,6 +209,10 @@ namespace Rpc.Wire
         public ulong Credit => _t.U64(48, 0);
 
         public uint Detail => _t.U32(56, 0);
+
+        public global::Rpc.Wire.BlobRef[] Blobs => _t.List(3, 24, (m, at) => global::Rpc.Wire.BlobRef.Read(m.Span, at));
+
+        public ulong Arena => _t.U64(64, 0);
 
     }
 

@@ -3,7 +3,7 @@
 /// Every WebSocket message is a binary frame of whole libbufs messages laid end to end, each 8-aligned:
 ///
 ///   client -> server   Envelope [, request message]      (Hello, Call, Cancel, Credit, Ping, Goodbye)
-///   server -> client   Envelope [, response message]     (Welcome, Data, End, Pong, Closing)
+///   server -> client   Envelope [, response message]     (Welcome, Data, End, Pong, Closing, Release)
 ///
 /// The message after the envelope is the method's own request or response table, so a call's payload is read in
 /// place on the other side and never wrapped, copied into a byte vector or re-encoded.
@@ -24,7 +24,16 @@ enum Kind : ubyte {
     Ping,       // either way; answered by Pong with the same `id`
     Pong,
     Goodbye,    // client: finish what is running, then close
-    Closing     // server: shutting down; no new calls are accepted
+    Closing,    // server: shutting down; no new calls are accepted
+    Release     // server: the shared-area blocks listed in `blobs` are free again (local sockets only)
+}
+
+/// One shared field of the message that follows the envelope (local sockets only; see the README).
+struct BlobRef {
+    field:uint;      // the field's slot in the message's root table
+    reserved:uint;   // 0
+    offset:ulong;    // into the sender's shared area
+    length:ulong;    // named length, not size: the C# generator gives every struct a Size constant
 }
 
 table Envelope {
@@ -44,6 +53,8 @@ table Envelope {
     max_inflight:uint;  // Welcome: calls the client may have running at once
     credit:ulong;       // Credit
     detail:uint;        // End: application-defined detail of the status (libsql: ErrorCode << 8 | Constraint); 0 = none
+    blobs:[BlobRef];    // Call / Data (client -> server): the message's shared fields, left empty in it. Release: blocks given back
+    arena:ulong;        // Hello: bytes of shared area the client sent; Welcome: bytes accepted (0 = none)
 }
 
 root_type Envelope;
