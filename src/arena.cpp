@@ -59,6 +59,13 @@ bool ClientArena::allocate(size_t bytes, uint64_t& offset) {
     } else if (bump_ + size <= memory_.size()) {
         at = bump_;
         bump_ += size;
+    } else if (inUse_.load(std::memory_order_relaxed) == 0 && bump_ != 0) {
+        // Nothing is Held or Sent (both counted under this mutex), so every carved block is free and none of the
+        // cached classes is worth keeping: start over, and a burst of another size finds the whole area. A block
+        // released twice is refused as before, since its entry reads kFree.
+        std::fill(std::begin(head_), std::end(head_), 0u);
+        bump_ = size;
+        at = 0;
     } else {
         return false;
     }

@@ -24,7 +24,9 @@ inline constexpr size_t kArenaPage = 4096;
 /// The client's end: one sealed memfd, mapped read-write, carved into power-of-two blocks (4 KiB and up).
 ///
 /// Blocks come from a bump pointer on first need and are never returned to it, only to their class's free list, so
-/// the steady state carves nothing and does not fragment. A side table indexed by offset / 4 KiB records each
+/// the steady state carves nothing and does not fragment. The one exception: a request nothing can satisfy while no
+/// block is in use resets the area (free lists and bump pointer), so a change of block size between bursts does not
+/// strand the capacity of the old size. A side table indexed by offset / 4 KiB records each
 /// block's class and state (so a block can be released by its offset alone) and chains the free lists; it is
 /// allocated once. A block is Held while the application owns it (SharedBuffer), Sent while it is on the wire and the
 /// server may read it, and returns to its free list from either.

@@ -1179,6 +1179,47 @@ void testTakenOutlivesTheEndpoint() {
     g_local = before;
 }
 
+// An area that is completely free serves any size, whatever sizes it served before.
+void testArenaReusesAcrossSizeClasses() {
+    std::puts("shared blobs: size changes between bursts");
+    const bool before = g_local;
+    g_local = true;
+    TestServer server(blobEndpoint());
+    rpc::Client client = server.connect(blobClient(64 << 10));
+    { rpc::SharedBuffer big = client.allocateShared(64 << 10); CHECK(big.shared()); }
+    CHECK(client.stats().arenaInUse == 0);
+    {
+        rpc::SharedBuffer half = client.allocateShared(32 << 10);
+        CHECK(half.shared());
+        fillPattern(half.data(), half.size(), 3);
+        // blocks in use are never handed out twice, and a request that cannot fit while one is held still fails
+        rpc::SharedBuffer other = client.allocateShared(32 << 10);
+        CHECK(other.shared());
+        CHECK(other.data() != half.data());
+        CHECK(!client.allocateShared(32 << 10).shared());
+        CHECK(half.data()[1] == static_cast<uint8_t>(1 * 7 + 3));
+    }
+    CHECK(client.stats().arenaInUse == 0);
+    // many small blocks, then one large again
+    {
+        std::vector<rpc::SharedBuffer> small;
+        for (int i = 0; i < 16; ++i)
+            small.push_back(client.allocateShared(4 << 10));
+        for (const auto& buffer : small)
+            CHECK(buffer.shared());
+    }
+    { rpc::SharedBuffer big = client.allocateShared(64 << 10); CHECK(big.shared()); }
+    // a block sent to the server and returned still works after a reset
+    {
+        test::BlobsClient blobs(client);
+        rpc::SharedBuffer buffer = client.allocateShared(16 << 10);
+        fillPattern(buffer.data(), buffer.size(), 5);
+        CHECK(blobs.Scan(std::move(buffer), 1)->result() == expectedLine(16 << 10, 5, true) + ":1");
+        CHECK(eventually([&] { return client.stats().arenaInUse == 0; }));
+    }
+    g_local = before;
+}
+
 // A 25 MB blob through rings a fraction of its size.
 void testBlobsLarge() {
     std::puts("shared blobs: far larger than the ring");
@@ -1668,6 +1709,7 @@ int main(int argc, char** argv) {
     testBlobsLeases();
     testBlobsLarge();
     testIdleStreamReadHonorsDeadline();
+    testArenaReusesAcrossSizeClasses();
     testTakenOutlivesTheEndpoint();
     testBlobsValidation();
     testBlobsHandshake();
