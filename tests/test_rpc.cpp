@@ -18,8 +18,19 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
 #include "calc_service.hpp"
+#include "ipc_common.hpp"
 #include "kitchen_service.hpp"
+#include "bufs/fd.hpp"
+#include "bufs/local.hpp"
+#include "bufs/shm.hpp"
+#include "http/websocket_client.hpp"
+#include "rpc/detail/frame.hpp"
 
 using namespace std::chrono_literals;
 using namespace sample::calc;
@@ -82,7 +93,7 @@ public:
         config.port = port_;
         config.ioThreads = 2;
         listener_ = std::make_unique<rpc::Listener>(config, std::move(options));
-        listener_->add(calc_).add(kitchens_).add(natural_);
+        listener_->add(calc_).add(kitchens_).add(natural_).add(blobs_);
         localPath_ = "/tmp/librpc-test-" + std::to_string(::getpid()) + "-" + std::to_string(port_) + ".sock";
         listener_->listenLocal(localPath_);
         thread_ = std::thread([this, grace] { listener_->run({}, grace); });
@@ -117,6 +128,7 @@ public:
         return g_local ? "unix://" + localPath_ : "ws://127.0.0.1:" + std::to_string(port_) + "/rpc";
     }
     const std::string& localPath() const { return localPath_; }
+    uint16_t port() const { return port_; }
 
     rpc::Client connect(rpc::ClientOptions options = {}) {
         for (int attempt = 0;; ++attempt) {
@@ -143,6 +155,7 @@ public:
 
     rpc::Listener& listener() { return *listener_; }
     test::NaturalImpl& natural() { return natural_; }
+    test::BlobsImpl& blobs() { return blobs_; }
 
 private:
     uint16_t port_;
@@ -150,6 +163,7 @@ private:
     CalcImpl calc_;
     test::KitchensImpl kitchens_;
     test::NaturalImpl natural_;
+    test::BlobsImpl blobs_;
     std::unique_ptr<rpc::Listener> listener_;
     std::thread thread_;
     std::mutex mutex_;
@@ -850,6 +864,701 @@ void testSessionFeatures() {
     g_local = false;
 }
 
+
+// ---- shared blobs -------------------------------------------------------------------------------------------------
+
+// Polls `fn` until it is true.
+template <class Fn>
+bool eventually(Fn&& fn, std::chrono::milliseconds timeout = 3s) {
+    const auto until = std::chrono::steady_clock::now() + timeout;
+    while (!fn()) {
+        if (std::chrono::steady_clock::now() >= until)
+            return false;
+        std::this_thread::sleep_for(5ms);
+    }
+    return true;
+}
+
+// A pattern of `size` bytes, and the sum a server computes for it.
+void fillPattern(uint8_t* data, size_t size, int seed) {
+    for (size_t i = 0; i < size; ++i)
+        data[i] = static_cast<uint8_t>(i * 7 + seed);
+}
+std::string expectedLine(size_t size, int seed, bool shared) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < size; ++i)
+        sum += static_cast<uint8_t>(i * 7 + seed);
+    return std::to_string(sum) + ":" + std::to_string(size) + ":" + (shared ? "1" : "0");
+}
+
+rpc::EndpointOptions blobEndpoint(uint64_t perSession = 8 << 20) { return rpc::EndpointOptions().sharedArena(perSession); }
+rpc::ClientOptions blobClient(uint64_t arena = 4 << 20) {
+    rpc::ClientOptions options;
+    options.sharedArenaBytes = arena;
+    return options;
+}
+
+// Over a local socket the blobs travel by reference; over a WebSocket they are copied inline. Same calls, same answers.
+void testBlobsRoundTrip() {
+    std::puts("shared blobs: unary, client streams and bidirectional calls");
+    TestServer server(blobEndpoint());
+    rpc::Client client = server.connect(blobClient());
+    test::BlobsClient blobs(client);
+    const bool byReference = g_local;
+    CHECK(client.stats().arenaBytes == (g_local ? (4u << 20) : 0u));
+
+    // unary: a block of the shared area (or its inline fallback), and a plain span
+    {
+        rpc::SharedBuffer buffer = client.allocateShared(100000);
+        CHECK(buffer.size() == 100000 && buffer.shared() == byReference);
+        fillPattern(buffer.data(), buffer.size(), 3);
+        auto answer = blobs.Scan(std::move(buffer), 640);
+        CHECK(answer->result() == expectedLine(100000, 3, byReference) + ":640");
+        std::vector<uint8_t> plain(5000);
+        fillPattern(plain.data(), plain.size(), 9);
+        CHECK(blobs.Scan(rpc::Span<const uint8_t>(plain), 1)->result() == expectedLine(5000, 9, false) + ":1");
+        CHECK(blobs.Scan(rpc::Span<const uint8_t>(), 2)->result() == "0:0:0:2");
+        // two blobs in one call
+        rpc::SharedBuffer a = client.allocateShared(4096), b = client.allocateShared(10);
+        fillPattern(a.data(), a.size(), 1);
+        fillPattern(b.data(), b.size(), 2);
+        CHECK(blobs.Scan2(std::move(a), std::move(b))->result() == expectedLine(4096, 1, byReference) + "," + expectedLine(10, 2, byReference));
+    }
+    CHECK(client.stats().arenaInUse == 0);
+    CHECK(client.stats().blobsShared == (g_local ? 3u : 0u));
+
+    // a client stream whose items carry blobs
+    {
+        auto up = blobs.Upload();
+        std::string expected;
+        for (int i = 0; i < 6; ++i) {
+            rpc::SharedBuffer buffer = client.allocateShared(8000 + i);
+            fillPattern(buffer.data(), buffer.size(), i);
+            expected += (i ? ";" : "") + std::to_string(i) + "=" + expectedLine(8000 + i, i, byReference);
+            if (buffer.shared()) {
+                CHECK(up.write([&](test::Frame::Builder& p) { p.setSequence(i); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)}));
+            } else {
+                CHECK(up.write([&](test::Frame::Builder& p) { p.setSequence(i); p.setPixels(buffer.data(), buffer.size()); }));
+            }
+        }
+        CHECK(up.finish()->result() == expected);
+    }
+    // ... and a bidirectional one, read as it goes
+    {
+        auto echo = blobs.Echo();
+        for (int i = 0; i < 5; ++i) {
+            rpc::SharedBuffer buffer = client.allocateShared(3000);
+            fillPattern(buffer.data(), buffer.size(), 40 + i);
+            if (buffer.shared()) {
+                CHECK(echo.write([&](test::Frame::Builder& p) { p.setSequence(i); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)}));
+            } else {
+                CHECK(echo.write([&](test::Frame::Builder& p) { p.setSequence(i); p.setPixels(buffer.data(), buffer.size()); }));
+            }
+            CHECK(echo.next());
+            CHECK(echo->result() == std::to_string(i) + "=" + expectedLine(3000, 40 + i, byReference));
+        }
+        echo.closeSend();
+        CHECK(!echo.next());
+    }
+    CHECK(eventually([&] { return client.stats().arenaInUse == 0; }));
+}
+
+// Falling back to inline fields wherever the shared area is not there.
+void testBlobsInline() {
+    std::puts("shared blobs: inline fallback");
+    const auto scan = [](rpc::Client& client, size_t size, bool expectShared) {
+        test::BlobsClient blobs(client);
+        rpc::SharedBuffer buffer = client.allocateShared(size);
+        CHECK(buffer.shared() == expectShared);
+        fillPattern(buffer.data(), buffer.size(), 5);
+        CHECK(blobs.Scan(std::move(buffer), 3)->result() == expectedLine(size, 5, expectShared) + ":3");
+    };
+    const bool before = g_local;
+    g_local = true;
+    {
+        // a client that asks for no area
+        TestServer server(blobEndpoint());
+        rpc::Client client = server.connect();
+        CHECK(client.stats().arenaBytes == 0);
+        scan(client, 20000, false);
+        // a server that offers none
+        TestServer plain;
+        rpc::Client other = plain.connect(blobClient());
+        CHECK(other.stats().arenaBytes == 0);
+        scan(other, 20000, false);
+        CHECK(other.stats().blobsInline == 1);
+        // an area the server's cap cuts down
+        TestServer small(blobEndpoint(1 << 20));  // the cap is announced in MiB
+        rpc::Client cut = small.connect(blobClient(4 << 20));
+        CHECK(cut.stats().arenaBytes == (1u << 20));
+        scan(cut, 20000, true);
+    }
+    g_local = before;
+}
+
+// An area that is full: later blobs are inline, the calls still succeed.
+void testBlobsExhaustion() {
+    std::puts("shared blobs: a full area");
+    const bool before = g_local;
+    g_local = true;
+    TestServer server(blobEndpoint());
+    rpc::Client client = server.connect(blobClient(64 << 10));
+    test::BlobsClient blobs(client);
+    CHECK(client.stats().arenaBytes == 64u << 10);
+    std::vector<rpc::SharedBuffer> held;
+    for (int i = 0; i < 5; ++i) {
+        held.push_back(client.allocateShared(16 << 10));
+        fillPattern(held.back().data(), held.back().size(), i);
+    }
+    CHECK(held[0].shared() && held[3].shared() && !held[4].shared());
+    CHECK(client.stats().blobsInline == 1);
+    for (int i = 0; i < 5; ++i) {
+        const bool shared = held[i].shared();
+        CHECK(blobs.Scan(std::move(held[i]), i)->result() == expectedLine(16 << 10, i, shared) + ":" + std::to_string(i));
+    }
+    CHECK(client.stats().arenaInUse == 0);
+    // the blocks are reused
+    rpc::SharedBuffer again = client.allocateShared(16 << 10);
+    CHECK(again.shared());
+    // one larger than the whole area is inline too
+    CHECK(!client.allocateShared(1 << 20).shared());
+    g_local = before;
+}
+
+// When the blocks come back.
+void testBlobsLeases() {
+    std::puts("shared blobs: leases");
+    const bool before = g_local;
+    g_local = true;
+    TestServer server(blobEndpoint());
+    rpc::Client client = server.connect(blobClient(1 << 20));
+    test::BlobsClient blobs(client);
+
+    // unary: the block is the server's until the call ends
+    {
+        rpc::SharedBuffer buffer = client.allocateShared(64 << 10);
+        fillPattern(buffer.data(), buffer.size(), 1);
+        std::string answer;
+        std::thread caller([&] { answer = std::string(blobs.Slow(std::move(buffer), 400)->result()); });
+        std::this_thread::sleep_for(150ms);
+        CHECK(client.stats().arenaInUse >= (64u << 10));
+        caller.join();
+        CHECK(answer == expectedLine(64 << 10, 1, true));
+        CHECK(client.stats().arenaInUse == 0);
+    }
+    // a call that gives up keeps its block until the server's End
+    {
+        rpc::SharedBuffer buffer = client.allocateShared(64 << 10);
+        fillPattern(buffer.data(), buffer.size(), 2);
+        CHECK(throwsCode(rpc::Code::DeadlineExceeded, [&] { blobs.Slow(std::move(buffer), 400, rpc::CallOptions{50ms}); }));
+        CHECK(client.stats().arenaInUse >= (64u << 10));
+        CHECK(eventually([&] { return client.stats().arenaInUse == 0; }));
+        // ... and the connection is as good as new
+        CHECK(blobs.Scan(rpc::Span<const uint8_t>(), 0)->result() == "0:0:0:0");
+    }
+    // a stream without take(): the blocks come back as the items are read
+    {
+        auto up = blobs.Upload();
+        for (int i = 0; i < 20; ++i) {
+            rpc::SharedBuffer buffer = client.allocateShared(10000);
+            fillPattern(buffer.data(), buffer.size(), i);
+            CHECK(up.write([&](test::Frame::Builder& p) { p.setSequence(i); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)}));
+        }
+        CHECK(up.finish()->result().size() > 20);
+        CHECK(eventually([&] { return client.stats().arenaInUse == 0; }));
+    }
+    // a stream with take(): a held item keeps its block, and releasing it (on another thread) gives it back
+    {
+        auto keep = blobs.Keep();
+        for (int i = 0; i < 4; ++i) {
+            rpc::SharedBuffer buffer = client.allocateShared(10000);
+            fillPattern(buffer.data(), buffer.size(), 10 + i);
+            CHECK(keep.write([&](test::Frame::Builder& p) { p.setSequence(i); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)}));
+        }
+        CHECK(keep.finish()->result() == 4u);
+        CHECK(eventually([&] { return server.blobs().describeHeld().size() == 4; }));
+        std::this_thread::sleep_for(100ms);
+        CHECK(client.stats().arenaInUse > 0);
+        const auto held = server.blobs().describeHeld();
+        for (int i = 0; i < 4; ++i)
+            CHECK(held[i] == expectedLine(10000, 10 + i, true));
+        std::thread other([&] { server.blobs().releaseHeld(); });
+        other.join();
+        CHECK(eventually([&] { return client.stats().arenaInUse == 0; }));
+    }
+    // a handler that returns early: the items it never read come back
+    {
+        auto some = blobs.Some(1);
+        for (int i = 0; i < 6; ++i) {
+            rpc::SharedBuffer buffer = client.allocateShared(10000);
+            if (!some.write([&](test::Frame::Builder& p) { p.setSequence(i); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)}))
+                break;
+        }
+        CHECK(some.finish()->result() == 1u);
+        CHECK(eventually([&] { return client.stats().arenaInUse == 0; }));
+    }
+    // a buffer never sent is just freed
+    {
+        { rpc::SharedBuffer unused = client.allocateShared(100000); CHECK(client.stats().arenaInUse > 0); }
+        CHECK(client.stats().arenaInUse == 0);
+    }
+    g_local = before;
+}
+
+// A 25 MB blob through rings a fraction of its size.
+void testBlobsLarge() {
+    std::puts("shared blobs: far larger than the ring");
+    const bool before = g_local;
+    g_local = true;
+    TestServer server(rpc::EndpointOptions().maxMessage(1 << 20).sharedArena(64 << 20));
+    rpc::Client client = server.connect(blobClient(64 << 20));
+    test::BlobsClient blobs(client);
+    const size_t size = 25 << 20;
+    rpc::SharedBuffer buffer = client.allocateShared(size);
+    CHECK(buffer.shared());
+    fillPattern(buffer.data(), buffer.size(), 11);
+    CHECK(blobs.Scan(std::move(buffer), 1)->result() == expectedLine(size, 11, true) + ":1");
+    // inline, the same bytes would not fit a message
+    rpc::Client inlineClient = server.connect();
+    std::vector<uint8_t> big(size, 1);
+    CHECK(throwsCode(rpc::Code::ResourceExhausted, [&] { test::BlobsClient(inlineClient).Scan(rpc::Span<const uint8_t>(big), 1); }));
+    g_local = before;
+}
+
+// ---- a hand-driven local client: says what a real Client never would ---------------------------------------------
+
+class RawLocal {
+public:
+    explicit RawLocal(const std::string& path) {
+        socket_ = bufs::local::Socket::connect(path);
+        pollfd p{socket_.fd(), POLLIN, 0};
+        if (::poll(&p, 1, 5000) <= 0)
+            throw std::runtime_error("no handshake");
+        bufs::local::ReceivedFds fds;
+        rpc::detail::IpcHello hello;
+        if (socket_.receive(&hello, sizeof hello, fds) != static_cast<long>(sizeof hello) || hello.status != 0)
+            throw std::runtime_error("bad handshake");
+        arenaMiB = hello.arenaMiB;
+        channel_ = bufs::shm::Channel::adopt(fds.take(0), 1ull << 32);
+    }
+
+    // The shared area message, the way a client sends it (or not).
+    void sendArena(uint64_t announced, int fd, uint32_t magic = rpc::detail::IpcArena::kMagic) {
+        rpc::detail::IpcArena message;
+        message.magic = magic;
+        message.bytes = announced;
+        socket_.send(&message, sizeof message, &fd, 1);
+    }
+
+    void send(const std::pair<const uint8_t*, size_t>& env, const uint8_t* body = nullptr, size_t bodySize = 0) {
+        uint8_t* slot = channel_.send().reserve(env.second + bodySize, std::chrono::seconds(5), std::chrono::nanoseconds(0));
+        if (!slot)
+            throw std::runtime_error("ring full");
+        std::memcpy(slot, env.first, env.second);
+        if (bodySize)
+            std::memcpy(slot + env.second, body, bodySize);
+        channel_.send().commit(env.second + bodySize);
+    }
+
+    void hello(uint64_t arena) {
+        send(rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+            e.setKind(rpc::wire::Kind::Hello);
+            e.setProtocol(rpc::detail::kProtocol);
+            if (arena)
+                e.setArena(arena);
+        }));
+    }
+
+    struct Ref {
+        uint32_t field;
+        uint64_t offset;
+        uint64_t length;
+    };
+
+    // A Scan call (pixels left empty, width 7) with the given blob references.
+    void scan(uint32_t id, const std::vector<Ref>& refs, bool streaming = false) {
+        bufs::MessageBuilder builder;
+        builder.initRoot<test::BlobsScanRequest>().setWidth(7);
+        const auto sealed = builder.finish();
+        send(rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+                 e.setId(id);
+                 e.setKind(rpc::wire::Kind::Call);
+                 e.setMethod(test::BlobsMethods::Scan);
+                 (void)streaming;
+                 fillRefs(e, refs);
+             }),
+             sealed.first, sealed.second);
+    }
+
+    // An Upload call, then one item with the given references.
+    void upload(uint32_t id) {
+        bufs::MessageBuilder builder;
+        builder.initRoot<test::BlobsUploadRequest>();
+        const auto sealed = builder.finish();
+        send(rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+                 e.setId(id);
+                 e.setKind(rpc::wire::Kind::Call);
+                 e.setMethod(test::BlobsMethods::Upload);
+             }),
+             sealed.first, sealed.second);
+    }
+    void item(uint32_t id, const std::vector<Ref>& refs) {
+        bufs::MessageBuilder builder;
+        builder.initRoot<test::Frame>().setSequence(1);
+        const auto sealed = builder.finish();
+        send(rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+                 e.setId(id);
+                 e.setKind(rpc::wire::Kind::Data);
+                 fillRefs(e, refs);
+             }),
+             sealed.first, sealed.second);
+    }
+    void end(uint32_t id) {
+        send(rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+            e.setId(id);
+            e.setKind(rpc::wire::Kind::End);
+        }));
+    }
+
+    // The next frame within `timeout`; false if none came.
+    bool read(std::chrono::milliseconds timeout = 3s) {
+        const auto until = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            const uint8_t* data = nullptr;
+            size_t size = 0;
+            if (channel_.receive().front(data, size)) {
+                frame_ = bufs::BufferPool::global().acquire(size);
+                std::memcpy(frame_.data(), data, size);
+                channel_.receive().pop();
+                if (!rpc::detail::parseFrame(frame_.data(), size, parsed_))
+                    throw std::runtime_error("malformed frame from the server");
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= until)
+                return false;
+            channel_.receive().wait(10ms, std::chrono::nanoseconds(0));
+        }
+    }
+    const rpc::wire::Envelope::Reader& envelope() const { return parsed_.envelope; }
+
+    // Frames until the End of call `id` (Credit and Release frames are skipped): its code, or -1.
+    int endCode(uint32_t id) {
+        while (read()) {
+            if (envelope().kind() == rpc::wire::Kind::End && envelope().id() == id)
+                return envelope().code();
+        }
+        return -1;
+    }
+    // The server's answer to the Hello: the shared area it accepted.
+    int64_t welcomeArena() {
+        if (!read())
+            return -1;
+        return envelope().kind() == rpc::wire::Kind::Welcome ? static_cast<int64_t>(envelope().arena()) : -1;
+    }
+    // True once the server has closed the connection.
+    bool closedByServer(std::chrono::milliseconds timeout = 3s) {
+        return eventually([&] {
+            pollfd p{socket_.fd(), POLLRDHUP, 0};
+            return ::poll(&p, 1, 0) > 0 && (p.revents & (POLLHUP | POLLERR | POLLRDHUP));
+        }, timeout);
+    }
+
+    uint32_t arenaMiB = 0;
+
+private:
+    static void fillRefs(rpc::wire::Envelope::Builder& e, const std::vector<Ref>& refs) {
+        if (refs.empty())
+            return;
+        auto list = e.initBlobs(refs.size());
+        for (size_t i = 0; i < refs.size(); ++i) {
+            rpc::wire::BlobRef ref;
+            ref.field = refs[i].field;
+            ref.reserved = 0;
+            ref.offset = refs[i].offset;
+            ref.length = refs[i].length;
+            list.set(i, ref);
+        }
+    }
+
+    bufs::local::Socket socket_;
+    bufs::shm::Channel channel_;
+    bufs::Buffer frame_;
+    rpc::detail::Frame parsed_;
+};
+
+// A memfd of `bytes` with the seals a client puts on it (or `seals`).
+bufs::Fd makeArenaFd(size_t bytes, int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) {
+    bufs::Fd fd(static_cast<int>(::syscall(SYS_memfd_create, "test-arena", MFD_CLOEXEC | MFD_ALLOW_SEALING)));
+    if (!fd || ::ftruncate(fd.get(), static_cast<off_t>(bytes)) != 0)
+        throw std::runtime_error("memfd");
+    if (seals && ::fcntl(fd.get(), F_ADD_SEALS, seals) != 0)
+        throw std::runtime_error("seals");
+    return fd;
+}
+
+// What a hostile or broken client may send.
+void testBlobsValidation() {
+    std::puts("shared blobs: references are checked");
+    const bool before = g_local;
+    g_local = true;
+    TestServer server(blobEndpoint());
+    const uint32_t kPixels = test::BlobsScanRequestShared::pixels;
+    const uint64_t kArena = 64 << 10;
+    {
+        RawLocal c(server.localPath());
+        CHECK(c.arenaMiB == 8);
+        bufs::Fd fd = makeArenaFd(kArena);
+        c.sendArena(kArena, fd.get());
+        c.hello(kArena);
+        CHECK(c.welcomeArena() == static_cast<int64_t>(kArena));
+        const int ok = 0, invalid = static_cast<int>(rpc::Code::InvalidArgument);
+        uint32_t id = 1;
+        const auto expect = [&](std::vector<RawLocal::Ref> refs, int code) {
+            c.scan(id, refs);
+            CHECK(c.endCode(id) == code);
+            ++id;
+        };
+        expect({{kPixels, 8, 16}}, ok);                    // a good one
+        expect({{kPixels, 0, kArena}}, ok);                // the whole area
+        expect({{kPixels, kArena, 0}}, ok);                // empty, at the end
+        expect({{kPixels, kArena + 8, 0}}, invalid);       // starts past the end
+        expect({{kPixels, 8, kArena}}, invalid);           // runs past the end
+        expect({{kPixels, 8, UINT64_MAX}}, invalid);       // offset + size overflows
+        expect({{kPixels, UINT64_MAX - 7, 16}}, invalid);  // so does this
+        expect({{kPixels, 4, 16}}, invalid);               // unaligned
+        expect({{5, 8, 16}}, invalid);                     // not a shared field of the request
+        expect({{kPixels, 8, 16}, {kPixels, 32, 16}}, invalid);  // the same field twice
+        expect({{kPixels, 8, 16}}, ok);                    // and the connection still works
+        // a client stream item with a bad reference ends that call, not the connection
+        c.upload(id);
+        c.item(id, {{test::FrameShared::pixels, 8, 16}});
+        c.item(id, {{test::FrameShared::pixels, kArena, 16}});
+        CHECK(c.endCode(id) == invalid);
+        ++id;
+        expect({{kPixels, 8, 16}}, ok);
+        // five references: a protocol error, the connection is closed
+        c.scan(id, {{0, 0, 8}, {1, 8, 8}, {2, 16, 8}, {3, 24, 8}, {4, 32, 8}});
+        CHECK(c.closedByServer());
+    }
+    {
+        // references without any shared area
+        RawLocal c(server.localPath());
+        c.hello(0);
+        CHECK(c.welcomeArena() == 0);
+        c.scan(1, {{kPixels, 0, 8}});
+        CHECK(c.closedByServer());
+    }
+    {
+        // ... and over a WebSocket
+        http::WebSocketClient ws;
+        http::WebSocketClientOptions options;
+        options.subprotocols = {rpc::detail::kSubprotocol};
+        ws.connect("ws://127.0.0.1:" + std::to_string(server.port()) + "/rpc", options);
+        const auto hello = rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+            e.setKind(rpc::wire::Kind::Hello);
+            e.setProtocol(rpc::detail::kProtocol);
+        });
+        ws.sendBinary(hello.first, hello.second);
+        CHECK(ws.receive(std::chrono::steady_clock::now() + 3s, 15000ms).has_value());
+        bufs::MessageBuilder builder;
+        builder.initRoot<test::BlobsScanRequest>().setWidth(7);
+        const auto sealed = builder.finish();
+        const auto env = rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+            e.setId(1);
+            e.setKind(rpc::wire::Kind::Call);
+            e.setMethod(test::BlobsMethods::Scan);
+            auto list = e.initBlobs(1);
+            rpc::wire::BlobRef ref;
+            ref.field = kPixels;
+            ref.reserved = 0;
+            ref.offset = 0;
+            ref.length = 8;
+            list.set(0, ref);
+        });
+        std::vector<uint8_t> frame(env.second + sealed.second);
+        std::memcpy(frame.data(), env.first, env.second);
+        std::memcpy(frame.data() + env.second, sealed.first, sealed.second);
+        ws.sendBinary(frame.data(), frame.size());
+        bool closed = false;
+        try {
+            for (int i = 0; i < 10; ++i)
+                ws.receive(std::chrono::steady_clock::now() + 1s, 15000ms);
+        } catch (const http::WebSocketError& error) {
+            closed = error.kind() == http::WebSocketError::Kind::Closed && error.closeCode() == 1002;
+        }
+        CHECK(closed);
+    }
+    g_local = before;
+}
+
+// An area the server refuses is not an error: the connection goes on with inline fields.
+void testBlobsHandshake() {
+    std::puts("shared blobs: refused areas");
+    const bool before = g_local;
+    g_local = true;
+    const uint64_t kArena = 64 << 10;
+    TestServer server(blobEndpoint(1 << 20));  // the per-session cap is announced in whole MiB
+    const auto refused = [&](const char* what, uint64_t announced, auto&& send) {
+        RawLocal c(server.localPath());
+        send(c);
+        c.hello(announced);
+        const int64_t accepted = c.welcomeArena();
+        if (accepted != 0)
+            std::fprintf(stderr, "  (%s: the server accepted %lld)\n", what, static_cast<long long>(accepted));
+        CHECK(accepted == 0);
+        c.scan(1, {});  // inline: no references
+        const int code = c.endCode(1);
+        if (code != 0)
+            std::fprintf(stderr, "  (%s: the connection did not go on, End %d)\n", what, code);
+        CHECK(code == 0);
+    };
+    refused("unsealed", kArena, [&](RawLocal& c) { bufs::Fd fd = makeArenaFd(kArena, 0); c.sendArena(kArena, fd.get()); });
+    refused("only shrink-sealed", kArena, [&](RawLocal& c) { bufs::Fd fd = makeArenaFd(kArena, F_SEAL_SHRINK); c.sendArena(kArena, fd.get()); });
+    refused("smaller than announced", kArena, [&](RawLocal& c) { bufs::Fd fd = makeArenaFd(kArena / 2); c.sendArena(kArena, fd.get()); });
+    refused("announced differently", kArena, [&](RawLocal& c) { bufs::Fd fd = makeArenaFd(kArena); c.sendArena(kArena / 2, fd.get()); });
+    refused("over the cap", 2 << 20, [&](RawLocal& c) { bufs::Fd fd = makeArenaFd(2 << 20); c.sendArena(2 << 20, fd.get()); });
+    refused("never sent", kArena, [&](RawLocal&) {});
+    refused("wrong magic", kArena, [&](RawLocal& c) { bufs::Fd fd = makeArenaFd(kArena); c.sendArena(kArena, fd.get(), 0x12345678); });
+    refused("not a page multiple", 1000, [&](RawLocal& c) { bufs::Fd fd = makeArenaFd(1000); c.sendArena(1000, fd.get()); });
+    CHECK(server.listener().endpoint().stats().arenas == 0);
+
+    // the total cap over all sessions
+    {
+        TestServer capped(rpc::EndpointOptions().sharedArena(1 << 20).sharedArenaTotal(100 << 10));
+        rpc::Client first = capped.connect(blobClient(kArena));
+        rpc::Client second = capped.connect(blobClient(kArena));
+        CHECK(first.stats().arenaBytes == kArena && second.stats().arenaBytes == 0);
+        CHECK(capped.listener().endpoint().stats().arenas == 1 && capped.listener().endpoint().stats().arenaBytes == kArena);
+        // the second still works, inline
+        CHECK(test::BlobsClient(second).Scan(rpc::Span<const uint8_t>(), 4)->result() == "0:0:0:4");
+        first.close();
+        CHECK(eventually([&] { return capped.listener().endpoint().stats().arenas == 0; }));
+        rpc::Client third = capped.connect(blobClient(kArena));
+        CHECK(third.stats().arenaBytes == kArena);
+    }
+    g_local = before;
+}
+
+struct DeviceStub {
+    std::atomic<int> registered{0}, unregistered{0};
+    std::atomic<const void*> base{nullptr};
+    std::atomic<size_t> bytes{0};
+};
+
+// The device sees the area once, and it stays registered while anything still reads it.
+void testBlobsRegistration() {
+    std::puts("shared blobs: device registration");
+    const bool before = g_local;
+    g_local = true;
+    DeviceStub stub;
+    rpc::DeviceRegistration registration;
+    registration.ctx = &stub;
+    registration.registerMemory = [](void* ctx, void* data, size_t bytes) -> void* {
+        auto* s = static_cast<DeviceStub*>(ctx);
+        ++s->registered;
+        s->base = data;
+        s->bytes = bytes;
+        return static_cast<uint8_t*>(data) + 1;  // a fake device address, to be told from the host's
+    };
+    registration.unregisterMemory = [](void* ctx, void* data, size_t bytes) {
+        auto* s = static_cast<DeviceStub*>(ctx);
+        if (data == s->base && bytes == s->bytes)
+            ++s->unregistered;
+    };
+    TestServer server(blobEndpoint().sharedRegistration(registration));
+    {
+        rpc::Client client = server.connect(blobClient(1 << 20));
+        test::BlobsClient blobs(client);
+        CHECK(stub.registered == 1 && stub.unregistered == 0 && stub.bytes == (1u << 20));
+        auto keep = blobs.Keep();
+        for (int i = 0; i < 3; ++i) {
+            rpc::SharedBuffer buffer = client.allocateShared(5000);
+            fillPattern(buffer.data(), buffer.size(), i);
+            CHECK(keep.write([&](test::Frame::Builder& p) { p.setSequence(i); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)}));
+        }
+        CHECK(keep.finish()->result() == 3u);
+        CHECK(eventually([&] { return server.blobs().heldPointers().size() == 3; }));
+        for (const auto& pointers : server.blobs().heldPointers()) {
+            // device = (host address in the mapping) + 1, and the host address lies in the registered area
+            CHECK(pointers.second == static_cast<const uint8_t*>(pointers.first) + 1);
+            CHECK(pointers.first >= stub.base && static_cast<const uint8_t*>(pointers.first) < static_cast<const uint8_t*>(stub.base.load()) + stub.bytes);
+        }
+    }
+    // the client is gone, its session ends, but the held items still pin the registration
+    CHECK(eventually([&] { return server.listener().endpoint().stats().sessions == 0; }));
+    std::this_thread::sleep_for(100ms);
+    CHECK(stub.registered == 1 && stub.unregistered == 0);
+    CHECK(server.listener().endpoint().stats().arenas == 1);
+    CHECK(server.blobs().describeHeld()[1] == expectedLine(5000, 1, true));
+    server.blobs().releaseHeld();
+    CHECK(eventually([&] { return stub.unregistered == 1; }));
+    CHECK(server.listener().endpoint().stats().arenas == 0 && server.listener().endpoint().stats().arenaBytes == 0);
+    // a device that refuses: the connection goes on without a shared area
+    {
+        rpc::DeviceRegistration refuse = registration;
+        refuse.registerMemory = [](void*, void*, size_t) -> void* { return nullptr; };
+        TestServer refusing(blobEndpoint().sharedRegistration(refuse));
+        rpc::Client client = refusing.connect(blobClient(1 << 20));
+        CHECK(client.stats().arenaBytes == 0);
+        CHECK(test::BlobsClient(client).Scan(rpc::Span<const uint8_t>(), 4)->result() == "0:0:0:4");
+    }
+    g_local = before;
+}
+
+// A client process that is killed while the server holds one of its items.
+void testBlobsDeadClient(const char* self) {
+    std::puts("shared blobs: a client that dies");
+    const bool before = g_local;
+    g_local = true;
+    DeviceStub stub;
+    rpc::DeviceRegistration registration;
+    registration.ctx = &stub;
+    registration.registerMemory = [](void* ctx, void* data, size_t bytes) -> void* {
+        auto* s = static_cast<DeviceStub*>(ctx);
+        ++s->registered;
+        s->base = data;
+        s->bytes = bytes;
+        return data;
+    };
+    registration.unregisterMemory = [](void* ctx, void*, size_t) { ++static_cast<DeviceStub*>(ctx)->unregistered; };
+    TestServer server(blobEndpoint().sharedRegistration(registration));
+    const std::string path = server.localPath();
+    pid_t pid = 0;
+    const char* argv[] = {self, "--blob-child", path.c_str(), nullptr};
+    CHECK(::posix_spawn(&pid, self, nullptr, nullptr, const_cast<char* const*>(argv), environ) == 0);
+    CHECK(eventually([&] { return server.blobs().heldPointers().size() == 3; }, 10s));
+    ::kill(pid, SIGKILL);
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    CHECK(eventually([&] { return server.listener().endpoint().stats().sessions == 0; }));
+    // the bytes are still there to read, and still registered
+    const auto held = server.blobs().describeHeld();
+    CHECK(held.size() == 3);
+    for (size_t i = 0; i < held.size(); ++i)
+        CHECK(held[i] == expectedLine(7000, 20 + static_cast<int>(i), true));
+    CHECK(stub.registered == 1 && stub.unregistered == 0);
+    server.blobs().releaseHeld();
+    CHECK(eventually([&] { return stub.unregistered == 1; }));
+    g_local = before;
+}
+
+// The other end of testBlobsDeadClient: sends three items to Keep and waits to be killed.
+int blobChild(const char* path) {
+    rpc::ClientOptions options;
+    options.sharedArenaBytes = 1 << 20;
+    rpc::Client client = rpc::Client::connect(std::string("unix://") + path, options);
+    test::BlobsClient blobs(client);
+    auto keep = blobs.Keep();
+    for (int i = 0; i < 3; ++i) {
+        rpc::SharedBuffer buffer = client.allocateShared(7000);
+        fillPattern(buffer.data(), buffer.size(), 20 + i);
+        if (!keep.write([&](test::Frame::Builder& p) { p.setSequence(i); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)}))
+            return 2;
+    }
+    for (;;)
+        std::this_thread::sleep_for(1s);
+}
+
 } // namespace
 
 void runAll() {
@@ -866,9 +1575,12 @@ void runAll() {
     testNatural();
     testStall();
     testShutdown();
+    testBlobsRoundTrip();
 }
 
 int main(int argc, char** argv) {
+    if (argc > 2 && std::strcmp(argv[1], "--blob-child") == 0)
+        return blobChild(argv[2]);
     for (const bool local : {false, true}) {
         g_local = local;
         std::printf("== over %s ==\n", local ? "a local socket" : "a WebSocket");
@@ -877,6 +1589,14 @@ int main(int argc, char** argv) {
     g_local = false;
     testLocalSocket();
     testSessionFeatures();
+    testBlobsInline();
+    testBlobsExhaustion();
+    testBlobsLeases();
+    testBlobsLarge();
+    testBlobsValidation();
+    testBlobsHandshake();
+    testBlobsRegistration();
+    testBlobsDeadClient(argv[0]);
     if (argc > 1)
         testOtherProcess(argv[1]);
     std::printf("%d checks, %d failed\n", g_checks, g_failures);

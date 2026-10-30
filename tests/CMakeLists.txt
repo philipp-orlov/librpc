@@ -2,7 +2,7 @@ set(examples ${CMAKE_CURRENT_SOURCE_DIR}/../examples)
 
 add_executable(rpc_test_rpc test_rpc.cpp)
 rpc_generate(rpc_test_rpc SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SOURCE_DIR}/kitchen.bufs)
-target_include_directories(rpc_test_rpc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(rpc_test_rpc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_test(NAME rpc_integration COMMAND rpc_test_rpc $<TARGET_FILE:rpc_interop_server>)
 set_tests_properties(rpc_integration PROPERTIES TIMEOUT 180)
 
@@ -40,8 +40,8 @@ set_tests_properties(rpc_rcc_rejects_unknown_type PROPERTIES
 
 # A warm server and client allocate nothing per call.
 add_executable(rpc_test_alloc test_alloc.cpp)
-rpc_generate(rpc_test_alloc SCHEMAS ${examples}/calc.bufs)
-target_include_directories(rpc_test_alloc PRIVATE ${examples})
+rpc_generate(rpc_test_alloc SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SOURCE_DIR}/kitchen.bufs)
+target_include_directories(rpc_test_alloc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME rpc_allocations COMMAND rpc_test_alloc)
 set_tests_properties(rpc_allocations PROPERTIES TIMEOUT 120)
 

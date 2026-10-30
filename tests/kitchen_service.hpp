@@ -5,7 +5,10 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include <sstream>
+#include <thread>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -263,6 +266,99 @@ public:
     }
 
     std::atomic<int> hooksRun{0};
+};
+
+
+/// "<sum of the bytes>:<size>:<1 if the bytes lay in the client's shared area>" (see Blobs in kitchen.bufs).
+inline std::string describeBlob(const rpc::Blob& blob) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < blob.size; ++i)
+        sum += blob.data[i];
+    return std::to_string(sum) + ":" + std::to_string(blob.size) + ":" + (blob.shared ? "1" : "0");
+}
+
+class BlobsImpl : public BlobsService {
+public:
+    std::string_view Scan(rpc::ServerContext&, rpc::Blob pixels, int32_t width) override {
+        thread_local std::string text;
+        text = describeBlob(pixels) + ":" + std::to_string(width);
+        return text;
+    }
+    std::string_view Scan2(rpc::ServerContext&, rpc::Blob a, rpc::Blob b) override {
+        thread_local std::string text;
+        text = describeBlob(a) + "," + describeBlob(b);
+        return text;
+    }
+    std::string_view Slow(rpc::ServerContext&, rpc::Blob pixels, uint32_t millis) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(millis));
+        thread_local std::string text;
+        text = describeBlob(pixels);
+        return text;
+    }
+    std::string_view Upload(rpc::ServerContext&, rpc::ServerReader<Frame>& frames) override {
+        thread_local std::string text;
+        text.clear();
+        while (frames.next()) {
+            if (!text.empty())
+                text += ";";
+            text += std::to_string(frames->sequence()) + "=" + describeBlob(frames.blob(FrameShared::pixels));
+            if (frames->hasExtra() || frames.blob(FrameShared::extra).size)
+                text += "+" + describeBlob(frames.blob(FrameShared::extra));
+        }
+        return text;
+    }
+    void Echo(rpc::ServerContext&, rpc::ServerReader<Frame>& frames, rpc::Writer<std::string_view>& out) override {
+        while (frames.next()) {
+            const std::string line = std::to_string(frames->sequence()) + "=" + describeBlob(frames.blob(FrameShared::pixels));
+            if (!out.write(line))
+                return;
+        }
+    }
+    uint32_t Keep(rpc::ServerContext&, rpc::ServerReader<Frame>& frames) override {
+        uint32_t n = 0;
+        while (frames.next()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            held_.push_back(frames.take());
+            ++n;
+        }
+        return n;
+    }
+    uint32_t Some(rpc::ServerContext&, uint32_t count, rpc::ServerReader<Frame>& frames) override {
+        uint32_t n = 0;
+        while (n < count && frames.next())
+            ++n;
+        return n;
+    }
+
+    // What Keep holds: described, then released on the calling thread.
+    std::vector<std::string> describeHeld() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> out;
+        for (const auto& item : held_)
+            out.push_back(describeBlob(item.blob(FrameShared::pixels)));
+        return out;
+    }
+    // (host address, device address) of each held item's pixels.
+    std::vector<std::pair<const void*, const void*>> heldPointers() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::pair<const void*, const void*>> out;
+        for (const auto& item : held_) {
+            const rpc::Blob blob = item.blob(FrameShared::pixels);
+            out.emplace_back(blob.data, blob.device);
+        }
+        return out;
+    }
+    void releaseHeld() {
+        std::vector<rpc::Taken<Frame>> items;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            items.swap(held_);
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<rpc::Taken<Frame>> held_;
 };
 
 } // namespace test

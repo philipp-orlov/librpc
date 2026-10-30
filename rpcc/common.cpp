@@ -45,6 +45,13 @@ void writeFile(const std::string& path, const std::string& text) {
 
 void check(const bufsc::Schema& schema) {
     std::map<uint32_t, std::string> ids;
+    // The envelope names a shared field by its slot, 64 at most.
+    for (const auto& table : schema.tables)
+        if (inMainFile(schema, *table))
+            for (const bufsc::Field& f : table->fields)
+                if (f.shared && f.refIndex >= 64)
+                    throw bufsc::SchemaError(table->file + ":" + std::to_string(f.line) + ": " + table->name + "." + f.name +
+                                             ": a (shared) field must be among the first 64 vectors, strings and tables of its table");
     for (const auto& service : schema.services) {
         if (!inMainFile(schema, *service))
             continue;

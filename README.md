@@ -248,6 +248,7 @@ its default). The tables are real libbufs messages in the generated header.
 | `[scalar]`, `[struct]` | `bufs::Vector<T>` | `rpc::Span<const T>` / `Response` | `number[]`, `Uint8Array` for `[ubyte]` |
 | `[bool]`, `[string]` | `bufs::BoolVector`, `bufs::StringVector` | `Span<const bool>`, `Span<const std::string_view>` | arrays |
 | table | `Table::Reader` | `rpc::Fill<Table>` (a function that fills it) / `Response<Table>` | `TableInit` / reader class |
+| `[ubyte] (shared)` | `rpc::Blob` | `rpc::Shared` (a `SharedBuffer`, or a span that goes inline) | `Uint8Array`, inline |
 
 **Streaming** is a `stream` in front of the result (the server sends many items), of the last parameter (the client sends
 many items: `Total(values: stream double): double`), or of both (`Running(values: stream double): stream double`, answers as
@@ -301,14 +302,76 @@ device), or an `rpc::PinnedPool`, a grow-only pool that registers each block onc
 `cudaHostRegister` / `cudaHostUnregister` (no CUDA dependency in librpc):
 
 ```cpp
-rpc::PinnedPool pool({[](void*, void* p, size_t n) { return cudaHostRegister(p, n, cudaHostRegisterDefault) == cudaSuccess; },
+rpc::PinnedPool pool({[](void*, void* p, size_t n) -> void* { return cudaHostRegister(p, n, cudaHostRegisterDefault) == cudaSuccess ? p : nullptr; },
                       [](void*, void* p, size_t) { cudaHostUnregister(p); }, nullptr});
 rpc::ClientOptions options;
 options.inboundMemory = pool.memory();   // the pool must outlive every message received through it
 ```
 
-C++ only (the TypeScript, C# and Python clients do not have it). See `include/rpc/memory.hpp` and design.md ("Caller-supplied
-memory for received frames").
+The registration returns the address the device reads the block at (the block's own where addressing is unified; on
+Tegra it differs), and `pool.device(host)` translates any byte of a block back. C++ only (the TypeScript, C# and Python
+clients do not have it). See `include/rpc/memory.hpp` and design.md ("Caller-supplied memory for received frames").
+
+## Shared blobs (zero-copy bulk data on local sockets)
+
+The copy above is still a copy, and the application's own write into the request is another. For bulk bytes on a **local
+socket** (raw pixels, audio samples) a `[ubyte]` field marked `(shared)` skips both: the client writes it once, into memory
+the server reads in place.
+
+```
+table Frame { sequence:ulong; pixels:[ubyte] (shared); }
+rpc_service Vision {
+    Recognize(pixels:[ubyte] (shared), width:int, height:int): Result;
+    Watch(frames: stream Frame): Summary;
+}
+```
+
+```cpp
+// client: ask for a shared area, fill a block of it, hand the block to the call
+rpc::ClientOptions options;
+options.sharedArenaBytes = 128 << 20;                      // room for a few frames in flight
+rpc::Client client = rpc::Client::connect("unix:///run/vision.sock", options);
+rpc::SharedBuffer frame = client.allocateShared(width * height * 3);
+fillFrame(frame.data(), frame.size());                  // the one write
+auto result = VisionClient(client).Recognize(std::move(frame), width, height);
+
+// server: the bytes are read where they lie
+rpc::Listener listener(config, rpc::EndpointOptions().sharedArena(128 << 20));
+//   Result Recognize(rpc::ServerContext&, rpc::Blob pixels, int32_t width, int32_t height) override {
+//       use(pixels.data, pixels.size);            // pixels.device: the address a GPU reads, with sharedRegistration
+//   }
+// streams: Watch(ctx, rpc::ServerReader<Frame>& frames) { while (frames.next()) { rpc::Blob b = frames.blob(FrameShared::pixels); ... } }
+//   frames.take() keeps an item and its blob past the next next(), for work that finishes later (a Taken<Frame>).
+// client streams: up.write([&](Frame::Builder& f) { f.setSequence(n); }, rpc::Share{FrameShared::pixels, std::move(frame)});
+```
+
+What happens: the client creates one sealed memfd per connection, hands it to the server over the socket and allocates
+power-of-two blocks from it (`allocateShared` never blocks and never throws for lack of room: when the area is full, or
+the server offered none, the buffer is an ordinary pooled one, `shared() == false`, and the field travels inline). A call
+names its blobs in the envelope as `{field, offset, size}`; the server maps the area read-only, checks every reference
+against the area's size before the handler runs (a bad one ends that call `InvalidArgument`), and the handler gets an
+`rpc::Blob`. The same code works over a WebSocket, from the TypeScript, C# and Python clients, and against a server that
+offers no area: the field is inline and `Blob::shared` is false.
+
+* **Safety.** The bulk bytes are opaque to librpc and the client can change them while the server reads them; the mapping is
+  read-only and the memfd sealed, so the server never faults, but it may see torn data. Use `(shared)` for data the server
+  would accept arbitrary and changing (pixels, samples), **never for bytes it parses** (JPEG, JSON, nested messages): the
+  message itself still goes through the ring, copied and verified.
+* **Leases.** A block belongs to the server until it says it is done: for a unary call or a stream call's request, until the
+  call's `End`; for a stream item, until the item is dropped (the next `next()`, the end of the handler, or a `Taken`
+  destroyed), reported in batched `Release` frames. A call the client gives up on (timeout, cancel) keeps its blocks until the
+  server's `End` or the disconnect.
+* **Devices.** `EndpointOptions::sharedRegistration` is called once per accepted area (`cudaHostRegister`) and undone when the
+  session and every lease into it are gone; `Blob::device` is the address a device reads. `ClientOptions::sharedRegistration`
+  does the same for a client that fills blobs with a kernel.
+* **Limits.** At most 4 blobs per message; a blob is as large as the area (not bound by `maxMessage`, so a 25 MB frame passes
+  through rings far smaller than itself); `sharedArena` (per session, announced in whole MiB) and `sharedArenaTotal` bound
+  what clients can make the server map and pin; blocks are 4 KiB-aligned power-of-two sizes, so size the area at about twice
+  the frames in flight. Off by default: with neither option set nothing changes on the wire.
+* **Stats.** `Client::stats()` (`blobsShared`, `blobsInline`, `arenaBytes`, `arenaInUse`), `Endpoint::Stats`
+  (`blobsShared`, `blobsInline`, `arenas`, `arenaBytes`).
+
+C++ over `unix://` only. Server-to-client blobs and file-descriptor parameters are not there. See design.md ("Shared blobs").
 
 ## What you get
 
@@ -338,6 +401,9 @@ memory for received frames").
 ## Not there yet
 
 * Client and bidirectional streaming in the table form (use the signature form with a `stream` parameter).
+* Shared blobs travelling server to client (responses are small for the use they were made for), and `(shared)` on fields of
+  nested tables (only top-level fields of a request or stream item), or on a hand-written table-form unary stub (use
+  `Client::unary(..., shares, count)`).
 * Automatic reconnect: a lost connection fails every call with `Unavailable`; connect again.
 * TypeScript has no verifier: a malformed message throws `RangeError`/`MalformedMessage` when read, it cannot read outside itself.
   The TypeScript and C# clients speak WebSockets only (a browser cannot open a Unix socket; local sockets are C++ to C++).

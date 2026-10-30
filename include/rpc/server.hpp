@@ -463,7 +463,8 @@ public:
         return *this;
     }
     /// Local connections: offer each client a shared area of up to `maxBytesPerSession` for blobs (rpc/shared.hpp). The
-    /// server maps it read-only. 0, the default, offers none and clients send those fields inline.
+    /// server maps it read-only. The cap is announced to clients in whole MiB (rounded up). 0, the default, offers none and
+    /// clients send those fields inline.
     EndpointOptions& sharedArena(uint64_t maxBytesPerSession) {
         sharedArena_ = maxBytesPerSession;
         return *this;

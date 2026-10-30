@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "calc_service.hpp"
+#include "kitchen_service.hpp"
 
 namespace {
 std::atomic<bool> g_counting{false};
@@ -132,17 +133,78 @@ void measure(const char* label, const std::string& url) {
            n / 20, 0);
 }
 
+// The blobs service without the per-byte work, which would dominate the timing of an unoptimised build.
+class CheapBlobs : public test::BlobsImpl {
+public:
+    std::string_view Scan(rpc::ServerContext&, rpc::Blob pixels, int32_t) override {
+        return pixels.shared && pixels.size ? "ok" : "bad";
+    }
+    std::string_view Upload(rpc::ServerContext&, rpc::ServerReader<test::Frame>& frames) override {
+        bool ok = true;
+        while (frames.next())
+            ok = ok && frames.blob(test::FrameShared::pixels).shared;
+        return ok ? "ok" : "bad";
+    }
+};
+
+// Bulk bytes by reference: a warm connection allocates nothing per call, with the blob in the shared area.
+void measureBlobs(const std::string& url) {
+    std::printf("shared blobs (local socket)\n");
+    rpc::ClientOptions options;
+    options.sharedArenaBytes = 16 << 20;
+    rpc::Client client = rpc::Client::connect(url, options);
+    test::BlobsClient blobs(client);
+    if (client.stats().arenaBytes == 0) {
+        std::printf("  no shared area was granted  FAILED\n");
+        ++g_failures;
+        return;
+    }
+    const size_t size = 1 << 20;
+    const int n = 20000;
+    auto unary = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            rpc::SharedBuffer buffer = client.allocateShared(size);
+            buffer.data()[0] = static_cast<uint8_t>(i);
+            blobs.Scan(std::move(buffer), i);
+        }
+    };
+    auto stream = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            auto up = blobs.Upload();
+            for (int k = 0; k < 20; ++k) {
+                rpc::SharedBuffer buffer = client.allocateShared(64 << 10);
+                buffer.data()[0] = static_cast<uint8_t>(k);
+                up.write([&](test::Frame::Builder& p) { p.setSequence(k); }, rpc::Share{test::FrameShared::pixels, std::move(buffer)});
+            }
+            up.finish();
+        }
+    };
+    // The rings are shared memory whose pages are touched as the write position first laps them: warm up past one lap.
+    unary(12000);
+    stream(1500);
+    flat("Scan: 1 MiB blob by reference", 5000, unary);
+    flat("Upload: 20 items with a 64 KiB blob each", 2000, stream);
+    report("Scan: 1 MiB blob by reference", allocationsDuring([&] { unary(n); }), n, 8);
+    report("Upload: 20 items with a 64 KiB blob each", allocationsDuring([&] { stream(n / 20); }), n / 20, 8);
+    if (client.stats().arenaInUse != 0) {
+        std::printf("  blocks left in use: %llu  FAILED\n", static_cast<unsigned long long>(client.stats().arenaInUse));
+        ++g_failures;
+    }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool onlyBlobs = argc > 1 && std::string(argv[1]) == "blobs";  // the shared-blob part alone
     const std::string path = "/tmp/librpc-alloc-" + std::to_string(::getpid()) + ".sock";
     http::ServerConfig config;
     config.host = "127.0.0.1";
     config.port = 18950;
     config.ioThreads = 1;
     CalcImpl calc;
-    rpc::Listener listener(config, rpc::EndpointOptions().workers(2));
-    listener.add(calc).listenLocal(path);
+    CheapBlobs blobsService;
+    rpc::Listener listener(config, rpc::EndpointOptions().workers(2).sharedArena(32 << 20));
+    listener.add(calc).add(blobsService).listenLocal(path);
     std::thread server([&] { listener.run(); });
     for (int i = 0; i < 100; ++i) {
         try {
@@ -152,8 +214,11 @@ int main() {
             std::this_thread::sleep_for(50ms);
         }
     }
-    measure("local socket", "unix://" + path);
-    measure("WebSocket", "ws://127.0.0.1:18950/rpc");
+    if (!onlyBlobs) {
+        measure("local socket", "unix://" + path);
+        measure("WebSocket", "ws://127.0.0.1:18950/rpc");
+    }
+    measureBlobs("unix://" + path);
     listener.stop();
     server.join();
     std::printf("%s\n", g_failures ? "FAILED" : "ok");

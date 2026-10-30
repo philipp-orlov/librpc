@@ -502,11 +502,12 @@ struct ClientImpl {
 
     // Takes one frame from the link, waiting for it at most until `deadline` (and 50 ms: close() and a dead peer
     // are noticed in slices), and dispatches it.
-    void pumpOnce(Clock::time_point deadline) {
+    // True when a frame was dispatched.
+    bool pumpOnce(Clock::time_point deadline) {
         Inbound inbound;
         try {
             if (!link->receive(inbound, std::min(deadline, Clock::now() + std::chrono::milliseconds(50))))
-                return;
+                return false;
         } catch (const LinkError& error) {
             bool wasStopping;
             {
@@ -515,14 +516,34 @@ struct ClientImpl {
             }
             if (!wasStopping)
                 fail(Status(Code::Unavailable, std::string("connection lost: ") + error.what()));
-            return;
+            return false;
         }
         Frame frame;
         if (!parseFrame(inbound.buffer.data(), inbound.size, frame)) {
             fail(Status(Code::DataLoss, "malformed frame from server"));
-            return;
+            return false;
         }
         dispatch(inbound, frame);
+        return true;
+    }
+
+    // A local connection has no reader thread, so what the server sent while nobody waited -- the End of a call that
+    // was given up, the Release of stream items -- sits in the ring. Reads it now, without waiting, unless another
+    // thread is reading anyway.
+    void drain() {
+        if (!leaderMode)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (closed || pumping)
+                return;
+            pumping = true;
+        }
+        while (pumpOnce(Clock::now())) {
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        pumping = false;
+        handoff();
     }
 
     // ---- blobs ----
@@ -994,6 +1015,7 @@ RawStream Client::openStream(uint32_t method, const uint8_t* request, size_t siz
 SharedBuffer Client::allocateShared(size_t bytes) {
     SharedBuffer buffer;
     if (impl_ && impl_->arena) {
+        impl_->drain();  // blocks the server has released since the last call become free
         uint64_t offset = 0;
         if (impl_->arena->allocate(bytes, offset)) {
             buffer.arena_ = impl_->arena;
@@ -1015,6 +1037,8 @@ Client::Stats Client::stats() const {
     Stats out;
     if (!impl_)
         return out;
+    if (impl_->arena)
+        impl_->drain();
     out.blobsShared = impl_->blobsShared.load(std::memory_order_relaxed);
     out.blobsInline = impl_->blobsInline.load(std::memory_order_relaxed);
     if (impl_->arena) {

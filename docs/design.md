@@ -86,6 +86,11 @@ server -> client   Envelope [response message]
 | `Ping`/`Pong` | either | Keep-alive for clients that cannot send WebSocket pings (browsers). |
 | `Goodbye` | C->S | Finish what is running, then close. |
 | `Closing` | S->C | The server is shutting down; new calls will be refused. |
+| `Release` | S->C | Local sockets: the shared-area blocks listed in `blobs` are free again (stream items; see "Shared blobs"). |
+
+`Hello` carries `arena` (bytes of shared area the client sent, local sockets only) and `Welcome` answers with the bytes
+accepted, 0 for none. `Call` and client `Data` frames may carry `blobs`: up to 4 `BlobRef{field, offset, length}` naming the message's
+`(shared)` fields, which the message leaves empty.
 
 A unary call is one frame each way. A client-streaming call is `Call`, any number of client `Data`, a client `End`, and the
 server's `End` carrying the answer; a bidirectional one interleaves the two directions freely. A server-streaming call is `Call`, any number of `Data`, then an `End` (with the trailer message
@@ -130,7 +135,8 @@ client                                            server (Endpoint::listenLocal)
 connect(2) to the socket file  ───────────────►  accept; SO_PEERCRED; authorize hook
                                ◄───────────────  IpcHello{ringBytes, status} + memfd of a new bufs::shm::Channel (SCM_RIGHTS)
 adopt the channel (seals checked)                 reader thread for this connection
-Hello / Welcome / Call / ...: frames written to the rings, read from the rings
+[IpcArena{bytes} + memfd of the shared area  ───►]   (only if it wants blobs and IpcHello.arenaMiB > 0)
+Hello{arena} / Welcome{arena} / Call / ...: frames written to the rings, read from the rings
 the socket stays open: a hang-up means the peer died
 ```
 
@@ -146,7 +152,8 @@ the socket stays open: a hang-up means the peer died
   its request polls the ring, dispatches whatever arrives (its own reply, or another caller's, whose condition variable it
   signals) and, when its own call is done, wakes a waiter to take over. A reply is thus handled on the thread that wants
   it, with no hand-off. A client that is not in a call does not read; what the server pushes meanwhile waits in the
-  ring (bounded by the window) until the next call or `connected()` looks.
+  ring (bounded by the window) until the next call, `connected()`, `allocateShared()` or `stats()` looks (the last two so that
+  blocks the server released come back to the allocator).
 * **Inline handlers.** A method marked `(inline)` (or all unary methods with `EndpointOptions::inlineUnary`) runs on the
   connection's reader thread instead of a worker: no queueing, no hand-off, the response goes out on the same thread. A handler
   that blocks holds up that connection's other calls; streaming calls always use a worker.
@@ -299,6 +306,8 @@ over a stream, or a deadline sends `Cancel`. Method names are `snake_case`; a ta
 | Idle connection | 5 min | `idleTimeout` (any frame resets it) |
 | Stalled stream / full ring | 30 s | `stallTimeout` |
 | Status message | 1 KiB | |
+| Shared area | none; `sharedArena` per session (announced in MiB), `sharedArenaTotal` over all | client `sharedArenaBytes` |
+| Blobs per message | 4 | `kMaxBlobsPerMessage` |
 
 ## 10. Memory discipline
 
@@ -318,6 +327,54 @@ over a stream, or a deadline sends `Cancel`. Method names are `snake_case`; a ta
 What does allocate: a status that carries a message (errors), the first use of a connection or a call slot, and
 whatever application code does.
 
+### Shared blobs (zero-copy bulk data on local sockets)
+
+Headers `include/rpc/shared.hpp`, `server.hpp`, `client.hpp`; implementation `src/arena.{hpp,cpp}` (allocator, mapping), `src/client.cpp`
+and `src/server.cpp` (leases, `Release`). Tests: `testBlobs*` in `tests/test_rpc.cpp`, the blob part of `tests/test_alloc.cpp`.
+
+**Why it is safe when the ring is not.** The ring is copied because the peer can change it while we parse it, and parsing
+structure from moving bytes is a memory-safety bug. A blob is opaque bytes librpc never interprets; a client that rewrites one
+while the server reads makes the server compute a wrong answer for that client and nothing else. So: the server maps the area
+`PROT_READ`; the memfd is sealed (`F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, so it cannot be truncated under the mapping -- no
+`SIGBUS`); every `{offset, length}` is bounds-checked against the sealed size before the handler runs, with overflow-safe
+arithmetic and 8-byte alignment. `(shared)` is documented as for data the server accepts arbitrary and changing.
+
+**Handshake.** `IpcHello.arenaMiB` (was reserved) is the largest area the server accepts per connection; 0 = not offered, which is
+what old servers send, so a new client never sends an area to one. A client with `sharedArenaBytes > 0` creates the memfd after
+adopting the channel, sends `IpcArena{magic "1RPA", version 1, bytes}` + the fd over the socket (SOCK_SEQPACKET keeps it ahead of the
+Hello), and its `Hello.arena` says how many bytes. The server reads the message without blocking when it processes the Hello, then
+validates in order: magic/version and `bytes` equal to `Hello.arena`; `bytes` a page multiple within the per-session cap; the total
+cap (an atomic counter, reserved before registering); `fstat` size equal; seals present; `mmap(PROT_READ)`; the registration hook
+returning an address. Any failure closes the fd and answers `Welcome.arena = 0`: the connection goes on, fields travel inline.
+Everything stays on protocol version 1.
+
+**Client allocator.** One mutex over power-of-two classes from 4 KiB to the area size; blocks come from a bump pointer on first need
+and only ever return to their class's free list (the `PinnedPool` discipline), so a warm connection carves nothing and does not
+fragment. A side table indexed by `offset / 4 KiB` (allocated once) records each block's class and state -- Held by the application,
+Sent and lent to the server -- and chains the free lists, so a block is released by its offset alone and a stray or repeated release
+is ignored. `allocateShared` never blocks: an exhausted area gives a pooled buffer that goes inline.
+
+**Leases.** The server hangs each accepted reference on the call (`ServerCall::blobs`) or stream item (`InItem::leases`) as a counted
+reference to the area plus `{offset, length, field}`; the area is unmapped and unregistered when the last one goes, so a `Taken`
+outlives the session safely (the held pages stay valid even if the client process died). Release is by kind:
+
+* a unary call's blobs, and those of a stream call's request, return with the call's `End` (the client frees them when it dispatches
+  it); no frame is needed;
+* a stream item's blobs return when the item is dropped -- replaced by the next `next()`, left unread when the handler returns (or
+  the client's stream is dropped), or its `Taken` destroyed -- by a `{offset, length}` appended to a per-session fixed-size queue,
+  sent as one `Release` frame when it fills (64), when the connection's reader goes idle, when the handler is about to wait for the
+  next item, and just before a `Credit`; a `Taken` destroyed on another thread flushes at once;
+* a call the client gave up on (timeout, `Cancel`) stays in the client's call table, with its blocks, until the server's `End` or the
+  disconnect: the server may still be reading.
+
+An invalid reference ends the call `InvalidArgument` (for a stream item, the call is aborted with that status and the item's listed
+blocks are released); more than 4, any at all without an accepted area, or any on a WebSocket, is a protocol error (close 1002).
+Flow control is unchanged: an item's credit goes out when the handler reads it, and `take()` keeps the item beyond that.
+
+**Cost.** One mutex and a few stores per allocation or release; no allocation on the call path (a `Taken` comes from a recycled pool
+like a call). Pinned memory is the sum of accepted areas (registration pins a whole area at once; an unregistered area costs only the
+pages the client touched), which `sharedArenaTotal` bounds.
+
 ### Caller-supplied memory for received frames (GPU-visible buffers)
 
 Header `include/rpc/memory.hpp`; implementation `src/memory.cpp` (`PinnedPool`), `include/rpc/detail/block.hpp` (`Block`,
@@ -333,8 +390,9 @@ copy lands*; a consumer then reads the message in GPU-visible memory with no sec
    a `Payload` destroyed, a stream item read), possibly after the client/endpoint is gone. Both are called concurrently from
    I/O threads. This is the way to assign per device, per stream or per NUMA node.
 2. **Registration.** `rpc::PinnedPool` is a grow-only pool of page-aligned blocks (power-of-two classes from 4 KiB) that calls
-   `Registration::registerMemory` once when a block is created and `unregisterMemory` at destruction -- wire these to
-   `cudaHostRegister` / `cudaHostUnregister`. Freed blocks go to a free list and are reused, so the steady state has no
+   `DeviceRegistration::registerMemory` once when a block is created and `unregisterMemory` at destruction -- wire these to
+   `cudaHostRegister` / `cudaHostUnregister`. The registration returns the block's device address and `PinnedPool::device(host)`
+   translates a byte of any block (`InboundMemory::device` carries that to the handler, see `Blob::device`). Freed blocks go to a free list and are reused, so the steady state has no
    allocation, no registration and no fragmentation. librpc itself has no CUDA dependency. Use `pool.memory()` to get the
    `InboundMemory`.
 

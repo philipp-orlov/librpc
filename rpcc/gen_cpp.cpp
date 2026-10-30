@@ -103,6 +103,46 @@ std::string store(const std::string& builder, const std::string& field, const Ty
 
 std::string argName(const Field& f) { return bufsc::cppAccessorName(f.name); }
 
+// ---- (shared) fields -----------------------------------------------------------------------------------------
+// A `[ubyte] (shared)` parameter is an rpc::Shared on the client (a SharedBuffer of the connection's shared area, or a
+// span that travels inline) and an rpc::Blob on the server (the bytes where they lie). The envelope names the field by
+// its slot in the request table: the constants <Table>Shared::<name>.
+
+// "::ns::TableShared::name": the slot of shared field `f` of `table`.
+std::string slotOf(const bufsc::TableDef& table, const Field& f) { return cppQualified(table) + "Shared::" + argName(f); }
+
+// A bit per slot of the table's shared fields (checked to fit in check()).
+uint64_t sharedMask(const bufsc::TableDef* table) {
+    uint64_t mask = 0;
+    if (table)
+        for (const Field& f : table->fields)
+            if (f.shared && f.refIndex >= 0 && f.refIndex < 64)
+                mask |= uint64_t{1} << f.refIndex;
+    return mask;
+}
+
+std::string maskLiteral(uint64_t mask) {
+    char text[40];
+    std::snprintf(text, sizeof text, "0x%llxull", static_cast<unsigned long long>(mask));
+    return text;
+}
+
+size_t sharedCount(const bufsc::RpcMethod& m) {
+    size_t n = 0;
+    for (const Field& f : m.params)
+        n += f.shared ? 1 : 0;
+    return n;
+}
+
+// The inline store of a shared parameter, when its buffer does not travel by reference.
+std::string storeSharedInline(const std::string& builder, const Field& f, size_t index) {
+    const std::string tag = std::to_string(index);
+    const std::string element = f.type.base == Base::Int8 ? "int8_t" : "uint8_t";
+    return "if (!rpcZeroCopy" + tag + ") { const auto rpcBytes" + tag + " = " + argName(f) + ".inlineBytes(); " + builder + "." +
+           bufsc::cppPrefixedName("set", f.name) + "(reinterpret_cast<const " + element + "*>(rpcBytes" + tag + ".data()), rpcBytes" + tag +
+           ".size()); }";
+}
+
 // "int step = 1" defaults: only a trailing run of scalar, bool and enum parameters can have them.
 std::string defaultArg(const Field& f) {
     if (f.defaultText.empty() || !plain(f.type) || f.type.base == Base::Struct)
@@ -116,6 +156,12 @@ std::string defaultArg(const Field& f) {
     return f.defaultText;
 }
 
+std::string paramType(const Field& f, bool server) {
+    if (f.shared)
+        return server ? "::rpc::Blob" : "::rpc::Shared";
+    return server ? serverParam(f.type) : clientParam(f.type);
+}
+
 std::string paramsDecl(const bufsc::RpcMethod& m, bool server) {
     size_t firstDefault = m.params.size();
     if (!server)
@@ -124,7 +170,7 @@ std::string paramsDecl(const bufsc::RpcMethod& m, bool server) {
     std::string out;
     for (size_t i = 0; i < m.params.size(); ++i) {
         const Field& f = m.params[i];
-        out += ", " + (server ? serverParam(f.type) : clientParam(f.type)) + " " + argName(f);
+        out += ", " + paramType(f, server) + " " + argName(f);
         if (!server && i >= firstDefault)
             out += " = " + defaultArg(f);
     }
@@ -186,8 +232,12 @@ std::string clientReturn(const bufsc::RpcMethod& m) {
 
 std::string readArgs(const bufsc::RpcMethod& m) {
     std::string out;
-    for (const Field& f : m.params)
-        out += ", rpcRequest." + bufsc::cppAccessorName(f.name) + "()";
+    for (const Field& f : m.params) {
+        if (f.shared)
+            out += ", rpcContext.blob(" + slotOf(*m.requestDef, f) + ", rpcRequest." + bufsc::cppAccessorName(f.name) + "())";
+        else
+            out += ", rpcRequest." + bufsc::cppAccessorName(f.name) + "()";
+    }
     return out;
 }
 
@@ -314,18 +364,31 @@ void naturalClient(std::ostream& out, const std::string& svc, const bufsc::RpcMe
     const std::string ret = clientReturn(m);
     out << "    " << ret << " " << m.name << "(" << (m.params.empty() ? "" : paramsDecl(m, false).substr(2)) << (m.params.empty() ? "" : ", ")
         << "const ::rpc::CallOptions& rpcOptions = {}) {\n";
+    // Shared parameters that are blocks of the shared area go into the call by reference; the others are stored inline.
+    const size_t shares = sharedCount(m);
+    std::string tail = ", rpcOptions";
+    if (shares) {
+        out << "        ::rpc::Share rpcShares[" << shares << "];\n        size_t rpcShareCount = 0;\n";
+        size_t index = 0;
+        for (const Field& f : m.params)
+            if (f.shared)
+                out << "        const bool rpcZeroCopy" << index++ << " = ::rpc::detail::takeShare(rpcShares, rpcShareCount, "
+                    << slotOf(*m.requestDef, f) << ", " << argName(f) << ");\n";
+        tail = ", rpcOptions, rpcShares, rpcShareCount";
+    }
     std::string fill = "[&](" + req + "::Builder& rpcB) { (void)rpcB;";
+    size_t sharedIndex = 0;
     for (const Field& f : m.params)
-        fill += " " + store("rpcB", f.name, f.type, argName(f));
+        fill += " " + (f.shared ? storeSharedInline("rpcB", f, sharedIndex++) : store("rpcB", f.name, f.type, argName(f)));
     fill += " }";
     if (m.streaming == "client" || m.streaming == "bidi") {
         out << "        return " << ret << "(client_.template openCall<" << req << ">(" << svc << "Methods::" << m.name << ", " << fill
-            << ", rpcOptions));\n    }\n\n";
+            << tail << "));\n    }\n\n";
         return;
     }
     if (m.streaming == "server") {
         const std::string call = "client_.template stream<" + req + ", " + resp + ">(" + svc + "Methods::" + m.name + ", " + fill +
-                                 ", rpcOptions)";
+                                 tail + ")";
         if (resultIsTable(m) && m.trailerDef)
             out << "        return " << ret << "(" << call << ");\n";
         else if (resultIsTable(m))
@@ -335,7 +398,7 @@ void naturalClient(std::ostream& out, const std::string& svc, const bufsc::RpcMe
                 << " { return rpcR.result(); });\n";
     } else {
         out << "        auto rpcResponse = client_.template unary<" << req << ", " << resp << ">(" << svc << "Methods::" << m.name << ", "
-            << fill << ", rpcOptions);\n";
+            << fill << tail << ");\n";
         if (m.isVoid)
             out << "        (void)rpcResponse;\n";
         else if (m.resultWrapped && plain(m.result))
@@ -360,6 +423,28 @@ std::string generateCppStubs(const bufsc::Schema& schema, const Options& options
         << "#include \"rpc/status.hpp\"\n"
         << "#ifndef RPC_NO_SERVER\n#include \"rpc/server.hpp\"\n#endif\n"
         << "#ifndef RPC_NO_CLIENT\n#include \"rpc/client.hpp\"\n#endif\n\n";
+
+    // The slot of every (shared) field, for the envelope's blob list and the handlers' ServerReader::blob.
+    for (const auto& table : schema.tables) {
+        if (!inMainFile(schema, *table))
+            continue;
+        bool any = false;
+        for (const Field& f : table->fields)
+            any = any || f.shared;
+        if (!any)
+            continue;
+        const std::string tns = cppNamespace(table->ns);
+        if (!tns.empty())
+            out << "namespace " << tns << " {\n";
+        out << "/// Slots of the (shared) fields of " << table->qualified() << ".\nstruct " << table->name << "Shared {\n";
+        for (const Field& f : table->fields)
+            if (f.shared)
+                out << "    static constexpr uint32_t " << argName(f) << " = " << f.refIndex << ";\n";
+        out << "};\n";
+        if (!tns.empty())
+            out << "} // namespace " << tns << "\n";
+        out << "\n";
+    }
 
     for (const auto& service : schema.services) {
         if (!inMainFile(schema, *service))
@@ -412,6 +497,10 @@ std::string generateCppStubs(const bufsc::Schema& schema, const Options& options
                 << "            method.streaming = ::rpc::Streaming::" << (m.streaming == "server" ? "Server" : m.streaming == "client" ? "Client" : m.streaming == "bidi" ? "Bidi" : "None") << ";\n"
                 << (m.attributes.count("inline") ? "            method.inlineHint = true;\n" : "")
                 << "            method.requestType = " << req << "::typeId;\n"
+                << (sharedMask(m.requestDef) ? "            method.sharedFields = " + maskLiteral(sharedMask(m.requestDef)) + ";\n" : "")
+                << ((m.streaming == "client" || m.streaming == "bidi") && sharedMask(m.inputDef)
+                        ? "            method.itemSharedFields = " + maskLiteral(sharedMask(m.inputDef)) + ";\n"
+                        : "")
                 << "            method.verifyRequest = [](const void* data, size_t size) { return ::bufs::verify<" << req
                 << ">(data, size); };\n";
             if (m.natural) {

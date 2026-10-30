@@ -78,3 +78,26 @@ rpc_service Natural {
     /// Blocks until the call is cancelled -- woken by ServerContext::onCancel, not by polling.
     Hang(): uint;
 }
+
+/// A frame of raw bytes. `pixels` and `extra` are (shared): on a local socket they travel by reference.
+table Frame {
+    sequence:ulong;
+    pixels:[ubyte] (shared);
+    extra:[ubyte] (shared);
+}
+
+/// Bulk bytes by reference. Every handler answers "<sum of the bytes>:<size>:<1 if it lay in the shared area>".
+rpc_service Blobs {
+    Scan(pixels: [ubyte] (shared), width: int): string;
+    Scan2(a: [ubyte] (shared), b: [ubyte] (shared)): string;
+    /// Sleeps `millis` before it reads the blob.
+    Slow(pixels: [ubyte] (shared), millis: uint): string;
+    /// One line per item, joined by ";".
+    Upload(frames: stream Frame): string;
+    /// A line per item, as it arrives.
+    Echo(frames: stream Frame): stream string;
+    /// Takes every item and keeps it until the test lets go; answers how many.
+    Keep(frames: stream Frame): uint;
+    /// Reads at most `count` items, then returns: the rest are left unread.
+    Some(count: uint, frames: stream Frame): uint;
+}
