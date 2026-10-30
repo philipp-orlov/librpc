@@ -1,0 +1,5 @@
+build*/
+ts/node_modules/
+ts/tests/gen/
+examples/ts/gen/
+examples/ts/dist/

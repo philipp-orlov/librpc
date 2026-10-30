@@ -1,0 +1,42 @@
+/// A calculator service: the example for librpc. Methods are written as signatures; rpcc makes the messages.
+namespace sample.calc;
+
+struct Point { x:float; y:float; }
+
+table Tick {
+    n:int;
+    label:string;
+    payload:[ubyte];
+}
+
+table Chunk { data: [ubyte]; }
+table Line { text: string; }
+
+rpc_service Calc {
+    /// a + b
+    Add(a: double, b: double): double (inline);
+    /// a - b
+    Sub(a: double, b: double): double (inline);
+    /// a / b. Dividing by zero is InvalidArgument.
+    Div(a: double, b: double): double (inline);
+    /// Adds up the values.
+    Sum(values: [double]): double (inline);
+    /// Counts from `from` to `to` (inclusive) by `step`, one item every `delay_ms`; every item carries
+    /// `payload_bytes` bytes of payload (to exercise flow control).
+    Count(from: int, to: int, step: int = 1, delay_ms: uint = 0, payload_bytes: uint = 0): stream Tick;
+    Echo(text: string): string (inline);
+    /// Length of the polyline origin -> points[0] -> points[1] ...
+    PathLength(origin: Point, points: [Point]): double (inline);
+    /// Waits (until cancelled or the deadline) and answers `millis`.
+    Sleep(millis: uint): uint;
+    /// Does nothing.
+    Ping(): void (inline);
+    /// Client streaming: adds up the numbers it is sent.
+    Total(values: stream double): double;
+    /// Bidirectional: answers each number with the running total so far, as it arrives.
+    Running(values: stream double): stream double;
+    /// Client streaming: counts the bytes of the chunks it is sent (the call also carries a name).
+    Upload(name: string, chunks: stream Chunk): ulong;
+    /// Bidirectional: answers each line with `prefix` in front of it.
+    Chat(prefix: string, lines: stream Line): stream Line;
+}

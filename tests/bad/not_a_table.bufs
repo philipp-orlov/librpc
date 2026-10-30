@@ -1,0 +1,4 @@
+namespace bad;
+enum E : ubyte { A }
+table A { x:int; }
+rpc_service S { M(E):A; }

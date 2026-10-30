@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Librpc</RootNamespace>
+    <AssemblyName>Librpc</AssemblyName>
+    <Description>RPC client for services written in libbufs schemas (rpcc --cs): messages, WebSocket transport, streaming</Description>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <ProjectReference Include="../../../libbufs/cs/Bufs/Bufs.csproj" />
+  </ItemGroup>
+</Project>
