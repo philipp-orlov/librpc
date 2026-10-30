@@ -195,7 +195,8 @@ producer that streams faster than the consumer reads would trigger either, so st
 * `StreamWriter::send` waits while `unacked + frame > window` (a frame larger than the window is sent when `unacked` is 0, so
   nothing can wedge); it returns false if the call is cancelled, the deadline passes or the connection closes;
 * the client counts the bytes of `Data` frames as its caller consumes them and sends `Credit` once a quarter window has
-  accumulated; items dropped by a cancelled call, and `Data` for calls that no longer exist, are credited too;
+  accumulated, or at once when it has read everything queued (otherwise a small frame followed by one that does not fit
+  in the rest of the window would wait for credit that never comes); items dropped by a cancelled call, and `Data` for calls that no longer exist, are credited too;
 * the window is the smallest of the client's `Hello.window`, `EndpointOptions::window` (1 MiB) and, for WebSockets, half
   of the `http::Server`'s `maxWebSocketQueuedBytes`;
 * a client that stops reading for `stallTimeout` (30 s) is cut: close 1008, and the call ends `Unavailable`.

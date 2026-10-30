@@ -698,7 +698,8 @@ private:
         cv_.notify_all();
     }
 
-    // StreamReader::next. Hands the handler the next item and, once a quarter window has been read, credits it.
+    // StreamReader::next. Hands the handler the next item and credits what has been read once a quarter window has piled
+    // up or the queue is empty (a sender holding a frame larger than the room left would otherwise wait forever).
     bool readerNext(ServerCall& call, const uint8_t*& message, size_t& size) {
         uint64_t report = 0;
         {
@@ -710,7 +711,7 @@ private:
             call.inBytes -= item.frameBytes;
             call.inConsumed += item.frameBytes;
             call.current = std::move(item);
-            if (call.inConsumed >= std::max<size_t>(window_ / 4, 1)) {
+            if (call.inCount == 0 || call.inConsumed >= std::max<size_t>(window_ / 4, 1)) {
                 report = call.inConsumed;
                 call.inConsumed = 0;
             }

@@ -273,13 +273,13 @@ public sealed class RpcClient : IAsyncDisposable
         call.Done ? Task.CompletedTask : SendFrameAsync(Envelope.Encode(new EnvelopeInit { Id = call.Id, Kind = Kind.End }), default, CancellationToken.None);
 
     // The caller consumed (or dropped) stream items of this many frame bytes: credit them once a quarter window has piled up.
-    internal void Consumed(int frameBytes)
+    internal void Consumed(int frameBytes, bool drained = false)
     {
         long report = 0;
         lock (_gate)
         {
             _consumed += frameBytes;
-            if (_consumed >= Math.Max(1, _window / 4))
+            if (drained || _consumed >= Math.Max(1, _window / 4))
             {
                 report = _consumed;
                 _consumed = 0;
@@ -589,7 +589,7 @@ public class RpcStream<T> : IAsyncEnumerable<T>
             {
                 while (reader.TryRead(out var entry))
                 {
-                    _client.Consumed(entry.FrameBytes);
+                    _client.Consumed(entry.FrameBytes, reader.Count == 0);
                     yield return (T)entry.Item!;
                 }
             }

@@ -275,6 +275,14 @@ void testStreamsFromTheClient() {
             CHECK(up.write([&](Chunk::Builder& c) { c.setData(data.data(), data.size()); }));
         CHECK(up.finish()->result() == 400u * 16 * 1024);
     }
+    // a small frame, then one too big for the rest of the window: the server credits the small one once it has read it
+    {
+        auto up = calc.Upload("mixed");
+        std::vector<uint8_t> small(100, 1), large(60 * 1024, 2);
+        CHECK(up.write([&](Chunk::Builder& c) { c.setData(small.data(), small.size()); }));
+        CHECK(up.write([&](Chunk::Builder& c) { c.setData(large.data(), large.size()); }));
+        CHECK(up.finish()->result() == small.size() + large.size());
+    }
     // bidirectional, one thread: each answer follows its question
     {
         auto run = calc.Running();

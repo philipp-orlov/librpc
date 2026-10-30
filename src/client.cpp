@@ -325,13 +325,15 @@ struct ClientImpl {
         }
     }
 
-    // `bytes` of stream items were consumed (or dropped): tell the server once a quarter window has piled up.
-    void consume(size_t bytes) {
+    // `bytes` of stream items were consumed (or dropped): tell the server once a quarter window has piled up, or at once
+    // when `drained` (the caller has nothing left queued), so a sender holding a frame larger than the room left is never
+    // stuck behind credit that would otherwise wait for more reads.
+    void consume(size_t bytes, bool drained = false) {
         uint64_t report = 0;
         {
             std::lock_guard<std::mutex> lock(mu);
             consumed += bytes;
-            if (consumed >= std::max<size_t>(window / 4, 1)) {
+            if (drained || consumed >= std::max<size_t>(window / 4, 1)) {
                 report = consumed;
                 consumed = 0;
             }
@@ -886,9 +888,10 @@ bool RawStream::next(Payload& item) {
     }
     if (state->id == id && state->hasItems()) {
         detail::Item front = state->pop();
+        const bool drained = !state->hasItems();
         lock.unlock();
         item = std::move(front.payload);
-        impl_->consume(front.frameBytes);
+        impl_->consume(front.frameBytes, drained);
         return true;
     }
     Status status = state->id == id ? std::move(state->status) : Status(Code::Cancelled, "cancelled");

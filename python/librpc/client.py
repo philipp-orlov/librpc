@@ -115,7 +115,7 @@ class RpcStream:
     async def __anext__(self):
         if self._items:
             value, frame_bytes = self._items.popleft()
-            self._client._consumed(frame_bytes)
+            self._client._consumed(frame_bytes, not self._items)
             return value
         if self._ended:
             if self._error:
@@ -362,10 +362,10 @@ class RpcClient:
             if not waiter.done():
                 waiter.set_result(None)
 
-    def _consumed(self, frame_bytes):
+    def _consumed(self, frame_bytes, drained=False):
         """Items the caller consumed (or that were dropped): report them once a quarter window has piled up."""
         self._unreported += frame_bytes
-        if self._unreported >= max(1, self._window // 4):
+        if drained or self._unreported >= max(1, self._window // 4):
             credit, self._unreported = self._unreported, 0
             try:
                 self._ws.send_nowait(wire.Envelope.encode(kind=wire.Kind.Credit, credit=credit))
