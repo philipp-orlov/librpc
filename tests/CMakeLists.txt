@@ -76,3 +76,8 @@ if(RPC_PYTHON)
 else()
     message(STATUS "librpc: Python tests skipped (python3 not found)")
 endif()
+
+# parseFrame rejects short tails without reading past the frame (run under ASan to see the difference).
+add_executable(rpc_test_frame test_frame.cpp)
+target_link_libraries(rpc_test_frame PRIVATE rpc)
+add_test(NAME rpc_parse_frame COMMAND rpc_test_frame)

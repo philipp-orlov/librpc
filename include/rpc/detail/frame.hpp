@@ -46,9 +46,13 @@ inline bool parseFrame(const uint8_t* data, size_t size, Frame& out) {
     out.bodyData = nullptr;
     out.bodySize = 0;
     if (envelopeSize < size) {
+        // The length check must come first: fewer than kHeaderBytes trailing bytes means even the 4-byte
+        // size field is not all inside the frame.
+        if (size - envelopeSize < bufs::kHeaderBytes)
+            return false;
         uint32_t bodySize = 0;
         std::memcpy(&bodySize, data + envelopeSize, sizeof bodySize);
-        if (size - envelopeSize < bufs::kHeaderBytes || bodySize != size - envelopeSize || bodySize % 8 != 0)
+        if (bodySize != size - envelopeSize || bodySize % 8 != 0)
             return false;
         out.bodyData = data + envelopeSize;
         out.bodySize = bodySize;
