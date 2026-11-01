@@ -23,7 +23,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  
+          cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DCMAKE_BUILD_TYPE=Release -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  
       - name: Build
         run: cmake --build build
       - name: Test
@@ -45,7 +45,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build
       - name: Test
@@ -70,7 +70,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  -DCMAKE_CXX_COMPILER=clang++ "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
+          cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  -DCMAKE_CXX_COMPILER=clang++ "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build
       - name: Test
