@@ -82,12 +82,12 @@ add_library(rpc::rpc ALIAS rpc)
 target_include_directories(rpc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${RPC_GENERATED_DIR}>)
-target_link_libraries(rpc PUBLIC http bufs::bufs Threads::Threads)
+target_link_libraries(rpc PUBLIC http bufs::bufs Threads::Threads $<BUILD_INTERFACE:develop::mem>)
 target_compile_options(rpc PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 # The envelope of the wire protocol: rpc/wire/rpc.bufs.hpp.
 bufs_generate(rpc SCHEMAS ${CMAKE_CURRENT_SOURCE_DIR}/include/rpc/wire/rpc.bufs
               OUTPUT_DIR ${RPC_GENERATED_DIR}/rpc/wire)
-target_link_libraries(rpc PUBLIC bufs::bufs)
+target_link_libraries(rpc PUBLIC bufs::bufs $<BUILD_INTERFACE:develop::mem>)
 
 if(RPC_BUILD_EXAMPLES)
     add_subdirectory(examples)

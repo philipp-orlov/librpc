@@ -25,6 +25,7 @@
 #include <mutex>
 #include <vector>
 
+#include "mem/registered_pool.hpp"
 #include "rpc/shared.hpp"
 
 namespace rpc {
@@ -84,7 +85,7 @@ public:
         uint64_t evictedBlocks = 0; // idle blocks unregistered by maxIdleBytes or trim()
     };
 
-    PinnedPool() = default;
+    PinnedPool() : pool_() {}
     /// A non-null result of registerMemory is the block's device address; nullptr = it could not be registered (that
     /// frame falls back to librpc's own pool). unregisterMemory is called for every registered block when the pool
     /// is destroyed.
@@ -104,40 +105,31 @@ public:
     /// Blocks created so far, their total bytes, and how many are out right now.
     size_t blocks() const;
     size_t bytes() const;
-    size_t inUse() const noexcept { return inUse_.load(std::memory_order_relaxed); }
+    size_t inUse() const noexcept { return pool_.stats().inUseBlocks; }
     Stats stats() const;
     /// Unregisters and frees idle blocks, largest first, until at most `keepIdleBytes` of them remain. Returns the
     /// bytes freed. Blocks that are out are never touched.
     size_t trim(size_t keepIdleBytes = 0);
 
 private:
-    static constexpr size_t kMinShift = 12;  // 4 KiB
-    static constexpr size_t kClasses = 53;
-
-    struct BlockInfo {
-        uintptr_t host;
-        size_t bytes;
-        void* device;
-    };
-
-    void* take(size_t bytes);
-    void give(void* data, size_t bytes);
-    // Detaches idle blocks past `keep` bytes (under the lock held by the caller); retire() runs outside it.
-    void evictLocked(size_t keep, std::vector<BlockInfo>& out);
-    void retire(const std::vector<BlockInfo>& blocks);
+    static void* registerBlock(void* ctx, void* host, size_t bytes) {
+        auto* self = static_cast<PinnedPool*>(ctx);
+        return self->registration_.registerMemory(self->registration_.ctx, host, bytes);
+    }
+    static void unregisterBlock(void* ctx, void* host, size_t bytes) {
+        auto* self = static_cast<PinnedPool*>(ctx);
+        if (self->registration_.unregisterMemory)
+            self->registration_.unregisterMemory(self->registration_.ctx, host, bytes);
+    }
+    static mem::RegisteredPool::Limits convert(Limits l) {
+        mem::RegisteredPool::Limits out;
+        out.maxBytes = l.maxBytes;
+        out.maxIdleBytes = l.maxIdleBytes;
+        return out;
+    }
 
     DeviceRegistration registration_;
-    Limits limits_;
-    mutable std::mutex mutex_;
-    std::vector<void*> free_[kClasses];
-    std::vector<BlockInfo> all_;  // every block, sorted by host address (grows only when the pool does)
-    std::atomic<size_t> inUse_{0};
-    size_t registeredBytes_ = 0;  // all_, in bytes
-    size_t reservedBytes_ = 0;    // being created right now, outside the lock
-    size_t idleBytes_ = 0;
-    size_t peakBytes_ = 0;
-    uint64_t refusals_ = 0;
-    uint64_t evicted_ = 0;
+    mem::RegisteredPool pool_;   // develop-core's libmem does the work: no heap use, registration once per block
 };
 
 } // namespace rpc
