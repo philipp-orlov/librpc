@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "mem/page_class_allocator.hpp"
 #include "bufs/fd.hpp"
 #include "bufs/shm.hpp"
 #include "rpc/shared.hpp"
@@ -44,17 +45,17 @@ public:
     uint64_t bytes() const noexcept { return memory_.size(); }
 
     /// A block of at least `bytes`; false when none is free (never blocks).
-    bool allocate(size_t bytes, uint64_t& offset);
+    bool allocate(size_t bytes, uint64_t& offset) { return alloc_->allocate(bytes, offset); }
     /// Held -> Sent. False if `offset` is not a Held block.
-    bool markSent(uint64_t offset) noexcept;
+    bool markSent(uint64_t offset) noexcept { return alloc_->markSent(offset); }
     /// A Held block the application did not send, back to the free list.
-    void releaseHeld(uint64_t offset) noexcept;
+    void releaseHeld(uint64_t offset) noexcept { alloc_->releaseHeld(offset); }
     /// A Sent block the server is done with, back to the free list. False if `offset` is not a Sent block (a
     /// misbehaving server; ignored).
-    bool releaseSent(uint64_t offset) noexcept;
+    bool releaseSent(uint64_t offset) noexcept { return alloc_->releaseSent(offset); }
 
     /// Bytes of blocks that are Held or Sent.
-    uint64_t inUse() const noexcept { return inUse_.load(std::memory_order_relaxed); }
+    uint64_t inUse() const noexcept { return alloc_->inUse(); }
     /// Where a device reads `offset`; nullptr without a registration.
     const void* device(uint64_t offset) const noexcept {
         return device_ ? static_cast<const uint8_t*>(device_) + offset : nullptr;
@@ -63,24 +64,10 @@ public:
 private:
     ClientArena() = default;
 
-    enum : uint8_t { kFree = 0, kHeld = 1, kSent = 2 };
-    struct Entry {
-        uint32_t next = 0;  // free list: index + 1 of the next free block of the class, 0 = end
-        uint8_t cls = 0;
-        uint8_t state = kFree;
-    };
-    static constexpr size_t kClasses = 53;
-
-    bool release(uint64_t offset, uint8_t expected) noexcept;
-
     bufs::shm::Memory memory_;
     DeviceRegistration registration_;
     void* device_ = nullptr;
-    std::mutex mutex_;
-    std::vector<Entry> pages_;       // fixed size: bytes / 4 KiB
-    uint32_t head_[kClasses] = {};   // free list heads (index + 1)
-    uint64_t bump_ = 0;
-    std::atomic<uint64_t> inUse_{0};
+    std::unique_ptr<mem::PageClassAllocator> alloc_;   // develop-core's libmem: offsets only, side table off-heap
 };
 
 /// Bytes of shared areas an endpoint has accepted, shared with the areas themselves so that one outliving the
