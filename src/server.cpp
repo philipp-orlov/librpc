@@ -1586,6 +1586,7 @@ void EndpointImpl::acceptLoop() {
                         continue;
                     }
                     bufs::shm::Channel channel = bufs::shm::Channel::createAnonymous("librpc", ringCapacity);
+                    channel.prefault();   // no page faults when the rings first lap, flat RSS from the start
                     const int fd = channel.fd();
                     if (!socket.send(&hello, sizeof hello, &fd, 1))
                         continue;

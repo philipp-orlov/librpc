@@ -113,6 +113,7 @@ public:
                 throw Error(Code::Unavailable, path + " sent no channel");
             arenaMiB_ = hello.arenaMiB;
             channel_ = bufs::shm::Channel::adopt(fds.take(0), 1ull << 32);
+            channel_.prefault();   // this side's mapping too (see Channel::prefault)
         } catch (const std::system_error& error) {
             throw Error(error.code() == std::errc::permission_denied ? Code::PermissionDenied : Code::Unavailable,
                         std::string("cannot connect to ") + path + ": " + error.what());
