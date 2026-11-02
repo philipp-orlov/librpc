@@ -53,13 +53,20 @@ if(NOT TARGET http)
     add_subdirectory("${RPC_HTTP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/http")
 endif()
 
+# develop-core supplies libschema (the .bufs front end): a sibling checkout by default.
+set(RPC_DEVELOP_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../develop-core" CACHE PATH "Path to a develop-core checkout")
+if(NOT TARGET develop::schema)
+    set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
+    add_subdirectory("${RPC_DEVELOP_CORE_DIR}" develop-core)
+endif()
+
 # --- the protocol compiler ----------------------------------------------------------------------------------
 # rpcc is bufsc with services: it links bufsc's parser and C++ generator (libbufs/bufsc) rather than copying them.
 set(RPCC_EXECUTABLE "" CACHE FILEPATH "A host rpcc to use when cross-compiling")
 add_executable(rpcc
     rpcc/main.cpp rpcc/common.cpp rpcc/gen_cpp.cpp rpcc/gen_ts.cpp rpcc/gen_cs.cpp rpcc/gen_py.cpp
-    ${RPC_BUFS_DIR}/bufsc/parser.cpp ${RPC_BUFS_DIR}/bufsc/check.cpp ${RPC_BUFS_DIR}/bufsc/generate_cpp.cpp
-    ${RPC_BUFS_DIR}/bufsc/generators.cpp)
+    ${RPC_BUFS_DIR}/bufsc/generate_cpp.cpp ${RPC_BUFS_DIR}/bufsc/generators.cpp)
+target_link_libraries(rpcc PRIVATE develop::schema)
 target_include_directories(rpcc PRIVATE rpcc ${RPC_BUFS_DIR}/bufsc)
 target_compile_options(rpcc PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 if(NOT CMAKE_CROSSCOMPILING)
