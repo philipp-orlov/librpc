@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include "schema/parse.hpp"
 #include <fstream>
 #include <map>
 
@@ -68,11 +69,7 @@ void check(const bufsc::Schema& schema) {
             if (method.trailerDef && method.natural && !method.isVoid && method.resultWrapped)
                 throw bufsc::SchemaError(where + service->name + "." + method.name + ": a trailer needs a stream of tables");
             const std::string name = methodName(*service, method);
-            uint32_t hash = 2166136261u;
-            for (char c : name) {
-                hash ^= static_cast<uint8_t>(c);
-                hash *= 16777619u;
-            }
+            const uint32_t hash = schema::methodId(name);
             const auto [it, fresh] = ids.emplace(hash, name);
             if (!fresh)
                 throw bufsc::SchemaError(where + "the method id of '" + name + "' collides with '" + it->second +

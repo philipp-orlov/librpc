@@ -3,6 +3,7 @@
 
 // <stem>.rpc.hpp: for every rpc_service a method table, a server base class and a typed client, all inline.
 
+#include "schema/parse.hpp"
 #include <sstream>
 
 #include "rpcc.hpp"
@@ -17,11 +18,7 @@ void docComment(std::ostream& out, const std::vector<std::string>& doc, const ch
 }
 
 std::string idLiteral(const std::string& name) {
-    uint32_t hash = 2166136261u;
-    for (char c : name) {
-        hash ^= static_cast<uint8_t>(c);
-        hash *= 16777619u;
-    }
+    const uint32_t hash = schema::methodId(name);
     char text[32];
     std::snprintf(text, sizeof text, "0x%08xu", hash);
     return text;

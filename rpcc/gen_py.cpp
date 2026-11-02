@@ -7,6 +7,7 @@
 //   rpc_service Svc {..}     ->  class SvcMethods (the method ids), class SvcClient (async methods; streams are returned
 //                                synchronously, as RpcStream / RpcUpload / RpcDuplex)
 
+#include "schema/parse.hpp"
 #include "gen_py.hpp"  // libbufs/bufsc
 #include "rpcc.hpp"
 
@@ -67,11 +68,7 @@ protected:
         const std::string name = service.name;
         out << "class " << name << "Methods:\n    \"\"\"Method ids of " << service.qualified() << ".\"\"\"\n    SERVICE = '" << service.qualified() << "'\n";
         for (const bufsc::RpcMethod& m : service.methods) {
-            uint32_t hash = 2166136261u;
-            for (char c : methodName(service, m)) {
-                hash ^= static_cast<uint8_t>(c);
-                hash *= 16777619u;
-            }
+            const uint32_t hash = schema::methodId(methodName(service, m));
             out << "    " << pyName(m.name) << " = " << hex32(hash) << "\n";
         }
         out << "\n\nclass " << name << "Client:\n";

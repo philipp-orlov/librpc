@@ -6,6 +6,7 @@
 //
 //   rpc_service Svc {..}     ->  public static class SvcMethods, public sealed class SvcClient
 
+#include "schema/parse.hpp"
 #include "gen_cs.hpp"  // libbufs/bufsc
 #include "rpcc.hpp"
 
@@ -88,11 +89,7 @@ protected:
         out << "    /// <summary>Method ids of " << service.qualified() << ".</summary>\n    public static class " << name << "Methods\n    {\n"
             << "        public const string Service = \"" << service.qualified() << "\";\n";
         for (const bufsc::RpcMethod& m : service.methods) {
-            uint32_t hash = 2166136261u;
-            for (char c : methodName(service, m)) {
-                hash ^= static_cast<uint8_t>(c);
-                hash *= 16777619u;
-            }
+            const uint32_t hash = schema::methodId(methodName(service, m));
             out << "        public const uint " << m.name << " = " << hex32(hash) << ";\n";
         }
         out << "    }\n\n";
