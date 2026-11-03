@@ -58,6 +58,21 @@ long residentKiB() {
     return resident * (sysconf(_SC_PAGESIZE) / 1024);
 }
 
+// A sanitizer's allocator holds freed blocks back (ASan's quarantine) and adds memory of its own, so resident memory
+// grows there without a leak; the RSS check means something only with the real allocator (as libsql's test_soak.cpp
+// has it). The allocation counts below still run.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+constexpr bool kSanitized = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+constexpr bool kSanitized = true;
+#else
+constexpr bool kSanitized = false;
+#endif
+#else
+constexpr bool kSanitized = false;
+#endif
+
 // Memory must not grow with the number of calls either: pools are reused, nothing is retained per call.
 template <class Fn>
 void flat(const char* what, int calls, Fn&& fn) {
@@ -65,8 +80,9 @@ void flat(const char* what, int calls, Fn&& fn) {
     const long before = residentKiB();
     fn(calls);
     const long after = residentKiB();
-    const bool ok = after - before < 1024;
-    std::printf("  %-44s RSS %ld -> %ld KiB over %d calls  %s\n", what, before, after, calls, ok ? "ok" : "GROWS");
+    const bool ok = kSanitized || after - before < 1024;
+    std::printf("  %-44s RSS %ld -> %ld KiB over %d calls  %s\n", what, before, after, calls,
+                kSanitized ? "not checked (sanitizer)" : ok ? "ok" : "GROWS");
     if (!ok)
         ++g_failures;
 }
