@@ -129,7 +129,7 @@ private:
     }
 
     DeviceRegistration registration_;
-    mem::RegisteredPool pool_;   // develop-core's libmem does the work: no heap use, registration once per block
+    mem::RegisteredPool pool_;   // libcore's libmem does the work: no heap use, registration once per block
 };
 
 } // namespace rpc

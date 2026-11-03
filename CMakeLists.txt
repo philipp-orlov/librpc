@@ -53,11 +53,11 @@ if(NOT TARGET http)
     add_subdirectory("${RPC_HTTP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/http")
 endif()
 
-# develop-core supplies libschema (the .bufs front end): a sibling checkout by default.
-set(RPC_DEVELOP_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../develop-core" CACHE PATH "Path to a develop-core checkout")
+# libcore supplies libschema (the .bufs front end): a sibling checkout by default.
+set(RPC_LIBCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libcore" CACHE PATH "Path to a libcore checkout")
 if(NOT TARGET develop::schema)
     set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
-    add_subdirectory("${RPC_DEVELOP_CORE_DIR}" develop-core)
+    add_subdirectory("${RPC_LIBCORE_DIR}" libcore)
 endif()
 
 # --- the protocol compiler ----------------------------------------------------------------------------------

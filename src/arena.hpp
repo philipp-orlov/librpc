@@ -67,7 +67,7 @@ private:
     bufs::shm::Memory memory_;
     DeviceRegistration registration_;
     void* device_ = nullptr;
-    std::unique_ptr<mem::PageClassAllocator> alloc_;   // develop-core's libmem: offsets only, side table off-heap
+    std::unique_ptr<mem::PageClassAllocator> alloc_;   // libcore's libmem: offsets only, side table off-heap
 };
 
 /// Bytes of shared areas an endpoint has accepted, shared with the areas themselves so that one outliving the
