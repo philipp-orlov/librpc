@@ -12,14 +12,19 @@ rpc_generate(rpc_interop_server SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SO
 target_include_directories(rpc_interop_server PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR})
 
 find_program(RPC_NODE node)
-if(RPC_NODE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../ts/node_modules/.bin/esbuild)
+set(rpc_node_version "")
+if(RPC_NODE)  # the client needs Node's global WebSocket, Node 22+ (README)
+    execute_process(COMMAND ${RPC_NODE} --version OUTPUT_VARIABLE rpc_node_version OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(REGEX REPLACE "^v" "" rpc_node_version "${rpc_node_version}")
+endif()
+if(RPC_NODE AND rpc_node_version VERSION_GREATER_EQUAL 22 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../ts/node_modules/.bin/esbuild)
     add_test(NAME rpc_typescript
              COMMAND ${RPC_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/../ts/tests/run.mjs
                      $<TARGET_FILE:rpc_interop_server> $<TARGET_FILE:rpcc>
                      ${CMAKE_CURRENT_BINARY_DIR}/ts)
     set_tests_properties(rpc_typescript PROPERTIES TIMEOUT 180)
 else()
-    message(STATUS "librpc: TypeScript tests skipped (node, or `npm install` in ts/, is missing)")
+    message(STATUS "librpc: TypeScript tests skipped (node 22+, or `npm install` in ts/, is missing)")
 endif()
 
 # The generated TypeScript wire codec checked in at ts/src/rpc.bufs.ts must match rpc.bufs.
