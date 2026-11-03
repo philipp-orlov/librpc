@@ -55,7 +55,7 @@ endif()
 
 # libcore supplies libschema (the .bufs front end): a sibling checkout by default.
 set(RPC_LIBCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libcore" CACHE PATH "Path to a libcore checkout")
-if(NOT TARGET develop::schema)
+if(NOT TARGET core::schema)
     set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
     add_subdirectory("${RPC_LIBCORE_DIR}" libcore)
 endif()
@@ -66,7 +66,7 @@ set(RPCC_EXECUTABLE "" CACHE FILEPATH "A host rpcc to use when cross-compiling")
 add_executable(rpcc
     rpcc/main.cpp rpcc/common.cpp rpcc/gen_cpp.cpp rpcc/gen_ts.cpp rpcc/gen_cs.cpp rpcc/gen_py.cpp
     ${RPC_BUFS_DIR}/bufsc/generate_cpp.cpp ${RPC_BUFS_DIR}/bufsc/generators.cpp)
-target_link_libraries(rpcc PRIVATE develop::schema)
+target_link_libraries(rpcc PRIVATE core::schema)
 target_include_directories(rpcc PRIVATE rpcc ${RPC_BUFS_DIR}/bufsc)
 target_compile_options(rpcc PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 if(NOT CMAKE_CROSSCOMPILING)
@@ -82,12 +82,12 @@ add_library(rpc::rpc ALIAS rpc)
 target_include_directories(rpc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${RPC_GENERATED_DIR}>)
-target_link_libraries(rpc PUBLIC http bufs::bufs Threads::Threads $<BUILD_INTERFACE:develop::mem>)
+target_link_libraries(rpc PUBLIC http bufs::bufs Threads::Threads $<BUILD_INTERFACE:core::mem>)
 target_compile_options(rpc PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 # The envelope of the wire protocol: rpc/wire/rpc.bufs.hpp.
 bufs_generate(rpc SCHEMAS ${CMAKE_CURRENT_SOURCE_DIR}/include/rpc/wire/rpc.bufs
               OUTPUT_DIR ${RPC_GENERATED_DIR}/rpc/wire)
-target_link_libraries(rpc PUBLIC bufs::bufs $<BUILD_INTERFACE:develop::mem>)
+target_link_libraries(rpc PUBLIC bufs::bufs $<BUILD_INTERFACE:core::mem>)
 
 if(RPC_BUILD_EXAMPLES)
     add_subdirectory(examples)
