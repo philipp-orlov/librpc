@@ -56,7 +56,7 @@ endif()
 # libcore supplies libschema (the .bufs front end): a sibling checkout by default.
 set(RPC_LIBCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libcore" CACHE PATH "Path to a libcore checkout")
 if(NOT TARGET core::schema)
-    set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
+    set(CORE_BUILD_TESTS OFF CACHE BOOL "")
     add_subdirectory("${RPC_LIBCORE_DIR}" libcore)
 endif()
 
