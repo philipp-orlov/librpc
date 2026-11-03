@@ -6,7 +6,10 @@
 #   rpc_generate(my_target SCHEMAS api.bufs [TS] [SKELETONS] [INCLUDE_DIRS dir...])
 #   target_link_libraries(my_target PRIVATE rpc::rpc)
 
-cmake_minimum_required(VERSION 3.16)
+# The range turns on the newer policies where CMake has them: CMP0116, for the
+# DEPFILEs of the generators (the paths in them are absolute, so either reading
+# agrees).
+cmake_minimum_required(VERSION 3.16...3.28)
 project(librpc VERSION 0.1.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
