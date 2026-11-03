@@ -4,6 +4,7 @@ set(ENV{DOTNET_CLI_TELEMETRY_OPTOUT} 1)
 set(ENV{DOTNET_NOLOGO} 1)
 set(ENV{DOTNET_SYSTEM_GLOBALIZATION_INVARIANT} 1)
 set(tests ${SOURCE}/cs/Librpc.Tests)
+file(MAKE_DIRECTORY ${tests}/gen)  # git-ignored, so absent from a fresh clone
 foreach(schema ${SOURCE}/examples/calc.bufs ${SOURCE}/tests/kitchen.bufs)
     execute_process(COMMAND ${RPCC} --no-cpp --cs -o ${tests}/gen ${schema} RESULT_VARIABLE rc)
     if(rc)

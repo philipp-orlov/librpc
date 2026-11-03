@@ -78,7 +78,9 @@ void report(const char* what, long allocations, int calls, long allowed) {
         ++g_failures;
 }
 
-void measure(const char* label, const std::string& url) {
+// `flatScale` divides the call counts of the memory-growth runs: over loopback TCP a call takes ~120 us, ten times the
+// local socket, and the full counts would take most of the test's time limit. The allocation counts keep `n`.
+void measure(const char* label, const std::string& url, int flatScale) {
     std::printf("%s\n", label);
     rpc::Client client = rpc::Client::connect(url);
     CalcClient calc(client);
@@ -92,10 +94,10 @@ void measure(const char* label, const std::string& url) {
         for (auto s = calc.Count(1, 20, 1, 0, 300); s.next();) {
         }
     }
-    flat("Add", 100000, [&](int n) { for (int i = 0; i < n; ++i) calc.Add(i, 1); });
-    flat("Echo 2 KB", 50000, [&](int n) { for (int i = 0; i < n; ++i) calc.Echo(text); });
-    flat("Sleep(0) on a worker", 50000, [&](int n) { for (int i = 0; i < n; ++i) calc.Sleep(0); });
-    flat("Count x 20 items", 5000, [&](int n) { for (int i = 0; i < n; ++i) for (auto s = calc.Count(1, 20, 1, 0, 300); s.next();) {} });
+    flat("Add", 100000 / flatScale, [&](int n) { for (int i = 0; i < n; ++i) calc.Add(i, 1); });
+    flat("Echo 2 KB", 50000 / flatScale, [&](int n) { for (int i = 0; i < n; ++i) calc.Echo(text); });
+    flat("Sleep(0) on a worker", 50000 / flatScale, [&](int n) { for (int i = 0; i < n; ++i) calc.Sleep(0); });
+    flat("Count x 20 items", 5000 / flatScale, [&](int n) { for (int i = 0; i < n; ++i) for (auto s = calc.Count(1, 20, 1, 0, 300); s.next();) {} });
     report("Add (unary, scalars)", allocationsDuring([&] { for (int i = 0; i < n; ++i) calc.Add(i, 1); }), n, 8);
     report("Echo 2 KB (string in, string out)", allocationsDuring([&] { for (int i = 0; i < n; ++i) calc.Echo(text); }), n, 8);
     report("Sleep(0) (handler on a worker thread)", allocationsDuring([&] { for (int i = 0; i < n; ++i) calc.Sleep(0); }), n, 8);
@@ -121,8 +123,8 @@ void measure(const char* label, const std::string& url) {
     };
     upload(500);
     duplex(500);
-    flat("Total (client stream of 20)", 3000, upload);
-    flat("Running (20 round trips on one call)", 3000, duplex);
+    flat("Total (client stream of 20)", 3000 / flatScale, upload);
+    flat("Running (20 round trips on one call)", 3000 / flatScale, duplex);
     report("Total: client stream of 20 items", allocationsDuring([&] { upload(n / 20); }), n / 20, 8);
     report("Running: bidirectional, 20 round trips", allocationsDuring([&] { duplex(n / 20); }), n / 20, 8);
     report("Count x 20 items of 300 B", allocationsDuring([&] {
@@ -215,8 +217,8 @@ int main(int argc, char** argv) {
         }
     }
     if (!onlyBlobs) {
-        measure("local socket", "unix://" + path);
-        measure("WebSocket", "ws://127.0.0.1:18950/rpc");
+        measure("local socket", "unix://" + path, 1);
+        measure("WebSocket", "ws://127.0.0.1:18950/rpc", 10);
     }
     measureBlobs("unix://" + path);
     listener.stop();

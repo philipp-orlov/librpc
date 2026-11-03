@@ -589,7 +589,8 @@ public class RpcStream<T> : IAsyncEnumerable<T>
             {
                 while (reader.TryRead(out var entry))
                 {
-                    _client.Consumed(entry.FrameBytes, reader.Count == 0);
+                    // drained: nothing queued behind this item. A single-reader unbounded channel cannot Count, but it can peek.
+                    _client.Consumed(entry.FrameBytes, !reader.TryPeek(out _));
                     yield return (T)entry.Item!;
                 }
             }
