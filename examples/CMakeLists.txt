@@ -32,5 +32,5 @@ if(RPC_PYTHON_EXAMPLES AND RPC_BUILD_TESTS)
         list(APPEND example_args --dotnet ${RPC_EXAMPLES_DOTNET})
     endif()
     add_test(NAME rpc_examples COMMAND ${RPC_PYTHON_EXAMPLES} ${CMAKE_CURRENT_SOURCE_DIR}/run_examples.py ${example_args})
-    set_tests_properties(rpc_examples PROPERTIES TIMEOUT 300)
+    set_tests_properties(rpc_examples PROPERTIES TIMEOUT 300 RESOURCE_LOCK rpc_cs_build)  # see rpc_csharp
 endif()

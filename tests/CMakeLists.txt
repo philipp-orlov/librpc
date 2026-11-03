@@ -44,11 +44,14 @@ set_tests_properties(rpc_rcc_rejects_unknown_type PROPERTIES
     PASS_REGULAR_EXPRESSION "rpcc: .*not_a_table.bufs:[0-9]+: .*is not a table")
 
 # A warm server and client allocate nothing per call.
-add_executable(rpc_test_alloc test_alloc.cpp)
-rpc_generate(rpc_test_alloc SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SOURCE_DIR}/kitchen.bufs)
-target_include_directories(rpc_test_alloc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR})
-add_test(NAME rpc_allocations COMMAND rpc_test_alloc)
-set_tests_properties(rpc_allocations PROPERTIES TIMEOUT 120)
+# It replaces operator new to count, which cannot link under ThreadSanitizer (its runtime defines operator new itself).
+if(NOT CMAKE_CXX_FLAGS MATCHES "sanitize=thread")
+    add_executable(rpc_test_alloc test_alloc.cpp)
+    rpc_generate(rpc_test_alloc SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SOURCE_DIR}/kitchen.bufs)
+    target_include_directories(rpc_test_alloc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME rpc_allocations COMMAND rpc_test_alloc)
+    set_tests_properties(rpc_allocations PROPERTIES TIMEOUT 120)
+endif()
 
 # The C# client (cs/) against the same server.
 find_program(RPC_DOTNET dotnet HINTS $ENV{DOTNET_ROOT} $ENV{HOME}/.dotnet)
@@ -56,7 +59,8 @@ if(RPC_DOTNET)
     add_test(NAME rpc_csharp
              COMMAND ${CMAKE_COMMAND} -DRPCC=$<TARGET_FILE:rpcc> -DSERVER=$<TARGET_FILE:rpc_interop_server>
                      -DDOTNET=${RPC_DOTNET} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/.. -P ${CMAKE_CURRENT_SOURCE_DIR}/csharp.cmake)
-    set_tests_properties(rpc_csharp PROPERTIES TIMEOUT 300 ENVIRONMENT "DOTNET_ROOT=${RPC_DOTNET}/..")
+    set_tests_properties(rpc_csharp PROPERTIES TIMEOUT 300 ENVIRONMENT "DOTNET_ROOT=${RPC_DOTNET}/.."
+                         RESOURCE_LOCK rpc_cs_build)  # dotnet builds cs/Librpc in place, like rpc_examples
 else()
     message(STATUS "librpc: C# tests skipped (dotnet not found)")
 endif()

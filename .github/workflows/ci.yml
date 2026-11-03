@@ -1,5 +1,6 @@
 # Release, address+undefined and thread sanitizer builds on every push and pull request.
-# Dependencies that live in other repositories are checked out next to the sources and passed by path.
+# librpc and the repositories it depends on are checked out side by side, as locally: the C# project and the Python
+# tests find libbufs as ../libbufs.
 name: ci
 
 on:
@@ -11,6 +12,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: librpc
       - uses: actions/checkout@v4
         with:
           repository: philipp-orlov/libcore
@@ -28,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DRPC_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=Release -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  
+          cmake -S librpc -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DRPC_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=Release -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  
       - name: Build
         run: cmake --build build
       - name: Test
@@ -38,6 +41,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: librpc
       - uses: actions/checkout@v4
         with:
           repository: philipp-orlov/libcore
@@ -55,7 +60,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DRPC_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake -S librpc -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DRPC_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build
       - name: Test
@@ -68,6 +73,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: librpc
       - uses: actions/checkout@v4
         with:
           repository: philipp-orlov/libcore
@@ -85,7 +92,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=ON -DRPC_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  -DCMAKE_CXX_COMPILER=clang++ "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
+          cmake -S librpc -B build -G Ninja -DBUILD_TESTING=ON -DRPC_BUILD_FUZZ=OFF -DRPC_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=Debug -DRPC_BUFS_DIR=$GITHUB_WORKSPACE/libbufs -DRPC_HTTP_DIR=$GITHUB_WORKSPACE/libhttp  -DCMAKE_CXX_COMPILER=clang++ "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build
       - name: Test
