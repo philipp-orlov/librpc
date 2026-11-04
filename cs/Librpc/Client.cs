@@ -67,6 +67,7 @@ public sealed class RpcClient : IAsyncDisposable
     private const string Subprotocol = "librpc.v1";
 
     private readonly ClientWebSocket _ws;
+    private int _heardFrame = 1;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly object _gate = new();
     private readonly Dictionary<uint, Call> _calls = new();
@@ -340,6 +341,7 @@ public sealed class RpcClient : IAsyncDisposable
             for (;;)
             {
                 var frame = await ReceiveAsync(_stop.Token).ConfigureAwait(false);
+                Volatile.Write(ref _heardFrame, 1);
                 Dispatch(frame);
             }
         }
@@ -354,8 +356,19 @@ public sealed class RpcClient : IAsyncDisposable
         using var timer = new PeriodicTimer(_options.PingInterval);
         try
         {
+            int missed = 0;
             while (await timer.WaitForNextTickAsync(_stop.Token).ConfigureAwait(false))
+            {
+                // Nothing heard since the ping before last: the peer is gone without saying so.
+                missed = Interlocked.Exchange(ref _heardFrame, 0) != 0 ? 0 : missed + 1;
+                if (missed >= 2)
+                {
+                    Lost(new RpcException(Code.Unavailable, "no reply from the server"));
+                    _ws.Abort();
+                    return;
+                }
                 await SendFrameAsync(Envelope.Encode(new EnvelopeInit { Kind = Kind.Ping }), default, _stop.Token).ConfigureAwait(false);
+            }
         }
         catch
         {

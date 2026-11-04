@@ -532,16 +532,31 @@ public:
         } catch (...) {
             status = Status(Code::Internal, "internal error");
         }
-        if (method.streaming == Streaming::Client || method.streaming == Streaming::Bidi)
-            releaseInbox(*call);
+        // Sending can throw (the buffer pool is exhausted). finish() below must still run, or the call stays in calls_
+        // for ever: call->session and session->calls_ then keep each other alive and inflight never reaches zero.
+        try {
+            if (method.streaming == Streaming::Client || method.streaming == Streaming::Bidi)
+                releaseInbox(*call);
+        } catch (...) {
+        }
         if (const uint16_t aborted = call->abortCode.load(std::memory_order_acquire))
             status = Status(static_cast<Code>(aborted), "bad blob reference");
         else if (call->stalled.load())
             status = Status(Code::Unavailable, "client is not reading its stream");
         else if (status.code() == Code::Cancelled && ep_.closing.load())
             status = Status(Code::Unavailable, "server is shutting down");  // cancelled because we are going away
-        if (!sentResponse)
-            sendEnd(call->id, status);
+        if (!sentResponse) {
+            try {
+                sendEnd(call->id, status);
+            } catch (...) {
+                // The client cannot be told; closing the connection fails its calls instead of leaving them waiting.
+                status = Status(Code::ResourceExhausted, "could not send the response");
+                try {
+                    link_->close(1011, "server out of buffers");
+                } catch (...) {
+                }
+            }
+        }
 
         if (!status.isOk())
             ep_.failed.fetch_add(1, std::memory_order_relaxed);
@@ -1212,8 +1227,18 @@ bool ServerCall::done() const {
 
 // Frames are queued by any thread and written by the connection's loop thread, in order. At most one post() to the
 // loop is outstanding per burst.
+class WebSocketServerLink;
+// The link whose message callback is running on this thread: the one case where this thread is the connection's loop.
+thread_local const WebSocketServerLink* t_loopLink = nullptr;
+
 class WebSocketServerLink final : public ServerLink, public std::enable_shared_from_this<WebSocketServerLink> {
 public:
+    struct OnLoop {
+        explicit OnLoop(const WebSocketServerLink* link) : previous(t_loopLink) { t_loopLink = link; }
+        ~OnLoop() { t_loopLink = previous; }
+        const WebSocketServerLink* previous;
+    };
+
     WebSocketServerLink(EndpointImpl& endpoint, std::shared_ptr<http::WebSocketConnection> socket)
         : ep_(endpoint), ws_(std::move(socket)) {}
 
@@ -1223,25 +1248,39 @@ public:
         frame.append(envelope, envelopeSize);
         if (bodySize)
             frame.append(body, bodySize);
+        // On the loop thread nothing is posted: it could not drain a full task queue while it waits for room in it.
+        const bool onLoop = t_loopLink == this;
         {
             std::lock_guard<std::mutex> lock(outMu_);
             if (closed_)
                 return false;
             outbox_.push_back(std::move(frame));
-            if (flushPending_)
+            if (onLoop) {
+                // handled below, outside the lock
+            } else if (flushPending_) {
                 return true;
+            } else {
             flushPending_ = true;
             // The posted task holds only `this` (so std::function keeps it inline); this reference keeps the link alive
             // until every posted task has run.
             ++postedTasks_;
             if (!keepAlive_)
                 keepAlive_ = shared_from_this();
+            }
         }
-        postFlush();
+        if (onLoop)
+            flush();
+        else
+            postFlush();
         return true;
     }
 
     void close(uint16_t code, std::string_view reason) override {
+        if (t_loopLink == this) {
+            flush();
+            ws_->close(code, reason);
+            return;
+        }
         auto self = shared_from_this();
         std::string text(reason);
         for (int attempt = 0; attempt < 1000 && !isClosed(); ++attempt) {
@@ -1505,6 +1544,7 @@ void EndpointImpl::attach(http::Server& target, std::string pattern) {
             }
             sessionsTotal.fetch_add(1, std::memory_order_relaxed);
             socket->onMessage([session, link, memory = options.inboundMemory_](std::string_view data, bool binary) {
+                const WebSocketServerLink::OnLoop onLoop(link.get());
                 if (!binary) {
                     link->close(1003, "text frames are not supported");
                     return;

@@ -186,6 +186,7 @@ class RpcClient:
         self._ws = ws
         self._window = window
         self._ping_interval = ping_interval
+        self._heard_frame = True
         self._next_id = 1
         self._calls = {}
         self._unreported = 0
@@ -388,14 +389,23 @@ class RpcClient:
             self._lost(RpcError(Code.Internal, f"client failure: {e!r}"))
 
     async def _ping_loop(self):
+        missed = 0
         while True:
             await asyncio.sleep(self._ping_interval)
+            # Nothing heard since the ping before last: the peer is gone without saying so.
+            missed = 0 if self._heard_frame else missed + 1
+            self._heard_frame = False
+            if missed >= 2:
+                self._lost(RpcError(Code.Unavailable, "no reply from the server"))
+                asyncio.ensure_future(self._ws.close(1001, "no reply"))
+                return
             try:
                 self._ws.send_nowait(wire.Envelope.encode(kind=wire.Kind.Ping))
             except Exception:
                 return
 
     def _on_frame(self, data):
+        self._heard_frame = True
         try:
             env = wire.Envelope.decode(data)
             size = message_size(data)
