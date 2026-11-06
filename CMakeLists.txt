@@ -12,6 +12,11 @@
 cmake_minimum_required(VERSION 3.16...3.28)
 project(librpc VERSION 0.1.0 LANGUAGES CXX)
 
+# A build configured without a type gets Release: optimized code, and smaller binaries.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "librpc requires a 64-bit target")
 endif()
