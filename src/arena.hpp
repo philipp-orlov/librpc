@@ -15,8 +15,14 @@
 
 #include "mem/page_class_allocator.hpp"
 #include "bufs/fd.hpp"
-#include "bufs/shm.hpp"
 #include "rpc/shared.hpp"
+
+#if defined(_WIN32)
+// Windows has no sealed anonymous shared memory to hand to another process, so a shared area is never offered there (the
+// Hello says so) and these classes exist only to keep the rest of the protocol core the same. create() and adopt() refuse.
+#else
+#include "bufs/shm.hpp"
+#endif
 
 namespace rpc::detail {
 
@@ -64,7 +70,15 @@ public:
 private:
     ClientArena() = default;
 
+#if defined(_WIN32)
+    struct NoMemory {
+        int fd() const noexcept { return -1; }
+        uint8_t* data() const noexcept { return nullptr; }
+        uint64_t size() const noexcept { return 0; }
+    } memory_;
+#else
     bufs::shm::Memory memory_;
+#endif
     DeviceRegistration registration_;
     void* device_ = nullptr;
     std::unique_ptr<mem::PageClassAllocator> alloc_;   // libcore's libmem: offsets only, side table off-heap

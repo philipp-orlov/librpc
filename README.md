@@ -273,6 +273,14 @@ wake-ups otherwise, after a short spin), one copy per direction, and nothing to 
 socket stays open so each side learns at once when the other process dies; the server also learns who the peer is
 (`Handshake::pid/uid/gid`, from the kernel) for its `authorize` hook, and the socket file is `0600` by default.
 
+**On Windows** the same URLs and the same `listenLocal` work, over a different carrier: the frames travel length-prefixed on the
+AF_UNIX socket itself (`src/stream_socket.*`), because Windows has no sealed anonymous shared memory, no descriptor passing and no
+cross-process futex. So there are no rings and no shared area there: `Client::allocateShared` hands back an ordinary buffer, and blobs
+go in the message as over a WebSocket. The peer's pid is the kernel's (`Handshake::pid`); `Handshake::uid` is 0 for a peer that runs as
+the server's account or as an elevated administrator and -1 for anyone else, which is what an `authorize` hook should test (there
+is no file mode to narrow the socket, so the folder's rights decide who can reach the file). `tests/test_local_windows.cpp` covers it.
+The figures below are the Linux rings'.
+
 On a 2-core arm64 VM (`bench/bench_rpc`, server in another process):
 
 | | WebSocket (loopback) | local socket |

@@ -3,7 +3,9 @@
 
 #include "rpc/client.hpp"
 
+#if !defined(_WIN32)
 #include <poll.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -13,8 +15,12 @@
 #include <optional>
 #include <thread>
 
+#if defined(_WIN32)
+#include "stream_socket.hpp"
+#else
 #include "bufs/local.hpp"
 #include "bufs/shm.hpp"
+#endif
 #include "http/websocket_client.hpp"
 #include "arena.hpp"
 #include "ipc_common.hpp"
@@ -90,6 +96,96 @@ private:
     std::chrono::milliseconds pingEvery_;
     InboundMemory memory_;
 };
+
+#if defined(_WIN32)
+
+// The local transport on Windows: frames behind a length on an AF_UNIX stream socket (stream_socket.hpp). No rings and no
+// shared area; the handshake is the same IpcHello, without a channel.
+class LocalClientLink final : public ClientLink {
+public:
+    LocalClientLink(const std::string& path, const ClientOptions& options) : memory_(options.inboundMemory) {
+        try {
+            socket_ = StreamSocket::connect(path, static_cast<int>(options.connectTimeout.count()));
+            IpcHello hello;
+            // Blocks until the server's handshake arrives; a server that never sends it is a dead one.
+            if (!socket_.receiveExactly(&hello, sizeof hello, static_cast<int>(options.connectTimeout.count())))
+                throw Error(Code::Unavailable, "no handshake from " + path);
+            if (hello.magic != IpcHello::kMagic || hello.version != 1)
+                throw Error(Code::Unavailable, path + " is not a librpc socket");
+            if (hello.status != 0)
+                throw Error(hello.status == 401 ? Code::Unauthenticated : hello.status == 403 ? Code::PermissionDenied : Code::Unavailable,
+                            path + " refused the connection (" + std::to_string(hello.status) + ")");
+            maxFrame_ = static_cast<size_t>(std::min<uint64_t>(hello.ringBytes / 2 - 8, 0xFFFFFFF0ull));
+            socket_.setSendTimeout(30000);  // a server that stopped reading
+        } catch (const Error&) {
+            throw;
+        } catch (const std::exception& error) {
+            throw Error(Code::Unavailable, std::string("cannot connect to ") + path + ": " + error.what());
+        }
+    }
+
+    void send(const uint8_t* envelope, size_t envelopeSize, const uint8_t* body, size_t bodySize) override {
+        if (envelopeSize + bodySize > maxFrame_)
+            throw LinkError("message exceeds the connection's limit");
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        if (closed_.load())
+            throw LinkError("the connection is closed");
+        try {
+            sendFrame(socket_, scratch_, envelope, envelopeSize, body, bodySize);
+        } catch (const std::exception& error) {
+            throw LinkError(error.what());
+        }
+    }
+
+    bool receive(Inbound& frame, Clock::time_point deadline) override {
+        try {
+            for (;;) {
+                if (closed_.load())
+                    throw LinkError("client closed");
+                const auto now = Clock::now();
+                // Slices, so that close() is noticed.
+                const auto slice = deadline > now ? std::min<Clock::duration>(deadline - now, std::chrono::milliseconds(50))
+                                                  : Clock::duration::zero();
+                switch (reader_.read(socket_, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(slice).count()),
+                                     data_, maxFrame_)) {
+                    case FrameReader::Result::Frame:
+                        frame.buffer = copyInbound(memory_, data_.data(), data_.size());
+                        frame.size = data_.size();
+                        return true;
+                    case FrameReader::Result::Closed:
+                        throw LinkError("the server went away");
+                    case FrameReader::Result::Timeout:
+                        if (Clock::now() >= deadline)
+                            return false;
+                        break;
+                }
+            }
+        } catch (const LinkError&) {
+            throw;
+        } catch (const std::exception& error) {
+            throw LinkError(error.what());
+        }
+    }
+
+    void close() noexcept override {
+        closed_.store(true);
+        socket_.shutdown();  // the server sees the connection end
+    }
+
+    size_t maxFrame() const noexcept override { return maxFrame_; }
+
+private:
+    StreamSocket socket_;
+    FrameReader reader_;
+    std::vector<uint8_t> data_;     // the reading thread's
+    std::vector<uint8_t> scratch_;  // under sendMutex_
+    size_t maxFrame_ = 0;
+    InboundMemory memory_;
+    std::mutex sendMutex_;
+    std::atomic<bool> closed_{false};
+};
+
+#else
 
 class LocalClientLink final : public ClientLink {
 public:
@@ -202,6 +298,8 @@ private:
     std::mutex sendMutex_;
     std::atomic<bool> closed_{false};
 };
+
+#endif
 
 // ---- call table -----------------------------------------------------------------------------------------------
 

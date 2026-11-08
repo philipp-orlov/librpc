@@ -3,9 +3,13 @@
 
 #include "rpc/server.hpp"
 
+#if defined(_WIN32)
+#include <io.h>
+#else
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <condition_variable>
@@ -17,8 +21,12 @@
 #include <thread>
 #include <unordered_map>
 
+#if defined(_WIN32)
+#include "stream_socket.hpp"
+#else
 #include "bufs/local.hpp"
 #include "bufs/shm.hpp"
+#endif
 #include "arena.hpp"
 #include "http/thread_pool.hpp"
 #include "ipc_common.hpp"
@@ -271,7 +279,11 @@ struct EndpointImpl {
     std::mutex localMutex;
     std::list<std::unique_ptr<LocalConnection>> localConnections;
     std::thread acceptor;
+#if defined(_WIN32)
+    StreamSocket listener;
+#else
     bufs::local::Socket listener;
+#endif
     std::string localPath;
     LocalOptions localOptions;
     size_t localMaxMessage = 0;
@@ -1362,6 +1374,87 @@ private:
 
 // ---- local transport: a socket for the handshake and for noticing a dead peer, two shared-memory rings for the frames
 
+#if defined(_WIN32)
+
+// On Windows the frames travel on the AF_UNIX stream socket itself (stream_socket.hpp), one length-prefixed frame after
+// another; the same socket tells the reading thread that the peer has gone. There is no shared area.
+class LocalServerLink final : public ServerLink {
+public:
+    LocalServerLink(EndpointImpl& endpoint, StreamSocket socket, std::string peer)
+        : ep_(endpoint), socket_(std::move(socket)), peer_(std::move(peer)),
+          maxFrame_(static_cast<size_t>(endpoint.ringCapacity / 2 - 8)) {
+        socket_.setSendTimeout(static_cast<int>(std::min<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(endpoint.options.stallTimeout_).count(), 0x7FFFFFFF)));
+    }
+
+    bool send(const uint8_t* envelope, size_t envelopeSize, const uint8_t* body, size_t bodySize) override {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        if (closed_.load() || envelopeSize + bodySize > maxFrame_)
+            return false;
+        try {
+            sendFrame(socket_, scratch_, envelope, envelopeSize, body, bodySize);
+            return true;
+        } catch (const std::exception&) {
+            abort();  // the client stopped reading, or has gone
+            return false;
+        }
+    }
+
+    // What was sent is already with the peer's kernel; it reads it, and then sees the connection end.
+    void close(uint16_t, std::string_view) override {
+        closed_.store(true);
+        socket_.shutdown();
+    }
+
+    std::string_view remoteAddress() const override { return peer_; }
+    bool dedicatedReader() const noexcept override { return true; }
+    size_t maxFrame() const noexcept override { return maxFrame_; }
+
+    // The reading thread.
+    void run(const std::shared_ptr<Session>& session) {
+        FrameReader reader;
+        std::vector<uint8_t> data;
+        try {
+            while (!closed_.load()) {
+                switch (reader.read(socket_, 50, data, maxFrame_)) {  // slices: close() is noticed
+                    case FrameReader::Result::Frame: {
+                        Block frame = copyInbound(ep_.options.inboundMemory_, data.data(), data.size());
+                        session->onFrame(std::move(frame), data.size(), true);
+                        continue;
+                    }
+                    case FrameReader::Result::Timeout:
+                        session->onIdle();
+                        continue;
+                    case FrameReader::Result::Closed:
+                        break;
+                }
+                break;
+            }
+        } catch (const std::exception&) {
+            // a frame beyond the limit, or a socket error: the peer is gone as far as we are concerned
+        }
+        closed_.store(true);
+        socket_.shutdown();
+        session->onClosed();
+    }
+
+private:
+    void abort() {
+        closed_.store(true);
+        socket_.shutdown();
+    }
+
+    EndpointImpl& ep_;
+    StreamSocket socket_;
+    std::string peer_;
+    size_t maxFrame_;
+    std::vector<uint8_t> scratch_;  // under sendMutex_
+    std::mutex sendMutex_;
+    std::atomic<bool> closed_{false};
+};
+
+#else
+
 class LocalServerLink final : public ServerLink {
 public:
     LocalServerLink(EndpointImpl& endpoint, bufs::local::Socket socket, bufs::shm::Channel channel, std::string peer)
@@ -1463,6 +1556,8 @@ private:
     std::mutex sendMutex_;
     std::atomic<bool> closed_{false};
 };
+
+#endif
 
 struct LocalConnection {
     std::shared_ptr<LocalServerLink> link;
@@ -1572,16 +1667,27 @@ void EndpointImpl::listenLocal(const std::string& path, LocalOptions local) {
         window = std::max<size_t>(options.window_, 1);
     ringCapacity = ringCapacityFor(localMaxMessage);
     ensurePool();
+#if defined(_WIN32)
+    (void)local;  // the file's mode: who may connect is the peer check in authorize (Handshake::uid), and the folder's rights
+    listener = StreamSocket::listen(path);
+#else
     listener = bufs::local::Socket::listen(path, static_cast<mode_t>(local.mode));
+#endif
     acceptor = std::thread([this] { acceptLoop(); });
 }
 
 void EndpointImpl::acceptLoop() {
     while (!closing.load()) {
+#if defined(_WIN32)
+        if (listener.waitReadable(100)) {
+            for (;;) {
+                StreamSocket socket;
+#else
         pollfd p{listener.fd(), POLLIN, 0};
         if (::poll(&p, 1, 100) > 0 && (p.revents & POLLIN)) {
             for (;;) {
                 bufs::local::Socket socket;
+#endif
                 try {
                     socket = listener.accept();
                 } catch (const std::exception&) {
@@ -1590,7 +1696,16 @@ void EndpointImpl::acceptLoop() {
                 if (!socket)
                     break;
                 try {
+#if defined(_WIN32)
+                    // "The owner" is the peer's account or an elevated administrator: uid 0 for it, -1 for anyone else.
+                    const PeerIdentity identity = socket.peer();
+                    struct {
+                        uint32_t pid;
+                        int uid, gid;
+                    } peer{identity.pid, identity.owner ? 0 : -1, -1};
+#else
                     const ucred peer = socket.peer();
+#endif
                     IpcHello hello;
                     hello.ringBytes = ringCapacity;
                     hello.arenaMiB = static_cast<uint32_t>(std::min<uint64_t>((options.sharedArena_ + (1u << 20) - 1) >> 20, UINT32_MAX));
@@ -1607,7 +1722,7 @@ void EndpointImpl::acceptLoop() {
                         handshake.path = localPath;
                         handshake.remoteAddress = peerText;
                         handshake.local = true;
-                        handshake.pid = peer.pid;
+                        handshake.pid = static_cast<int>(peer.pid);
                         handshake.uid = static_cast<int>(peer.uid);
                         handshake.gid = static_cast<int>(peer.gid);
                         handshake.header = [](std::string_view) -> std::string_view { return {}; };
@@ -1620,6 +1735,18 @@ void EndpointImpl::acceptLoop() {
                             principal = std::move(std::get<Principal>(result));
                         }
                     }
+#if defined(_WIN32)
+                    hello.arenaMiB = 0;  // no shared areas here
+                    if (refusal) {
+                        hello.status = refusal;
+                        socket.sendAll(&hello, sizeof hello);
+                        continue;
+                    }
+                    socket.sendAll(&hello, sizeof hello);
+                    const uint64_t id = nextSession.fetch_add(1);
+                    const bool known = principal.has_value();
+                    auto link = std::make_shared<LocalServerLink>(*this, std::move(socket), peerText);
+#else
                     if (refusal) {
                         hello.status = refusal;
                         socket.send(&hello, sizeof hello);
@@ -1633,6 +1760,7 @@ void EndpointImpl::acceptLoop() {
                     const uint64_t id = nextSession.fetch_add(1);
                     const bool known = principal.has_value();
                     auto link = std::make_shared<LocalServerLink>(*this, std::move(socket), std::move(channel), peerText);
+#endif
                     auto session = std::make_shared<Session>(*this, link, std::move(principal), id);
                     session->setAuthenticated(known);
                     session->needsPrincipal(options.requireAuth_);
@@ -1680,7 +1808,11 @@ void EndpointImpl::shutdown(std::chrono::milliseconds grace) {
         acceptor.join();
     }
     if (!localPath.empty())
+#if defined(_WIN32)
+        removeSocketFile(localPath);
+#else
         ::unlink(localPath.c_str());
+#endif
     std::vector<std::shared_ptr<Session>> live;
     {
         std::lock_guard<std::mutex> lock(mutex);

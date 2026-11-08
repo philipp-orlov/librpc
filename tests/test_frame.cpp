@@ -23,7 +23,7 @@ int g_failures = 0;
 
 struct Exact {
     explicit Exact(const std::vector<uint8_t>& bytes)
-        : data(new (std::align_val_t(8)) uint8_t[bytes.size()]), size(bytes.size()) {
+        : data(static_cast<uint8_t*>(::operator new[](bytes.size(), std::align_val_t(8)))), size(bytes.size()) {
         std::memcpy(data, bytes.data(), bytes.size());
     }
     ~Exact() { ::operator delete[](data, std::align_val_t(8)); }

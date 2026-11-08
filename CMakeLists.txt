@@ -86,6 +86,10 @@ include(cmake/RpcGenerate.cmake)
 # --- the runtime --------------------------------------------------------------------------------------------
 set(RPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 add_library(rpc STATIC src/memory.cpp src/status.cpp src/arena.cpp src/server.cpp src/client.cpp)
+if(WIN32)
+    # The local transport on Windows is a length-prefixed stream on an AF_UNIX socket (no shared-memory rings).
+    target_sources(rpc PRIVATE src/stream_socket.cpp)
+endif()
 add_library(rpc::rpc ALIAS rpc)
 target_include_directories(rpc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

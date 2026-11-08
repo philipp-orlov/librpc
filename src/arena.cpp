@@ -3,6 +3,29 @@
 
 #include "arena.hpp"
 
+#if defined(_WIN32)
+
+#include <system_error>
+
+namespace rpc::detail {
+
+std::shared_ptr<ClientArena> ClientArena::create(uint64_t, const DeviceRegistration&) {
+    throw std::system_error(std::make_error_code(std::errc::function_not_supported), "no shared areas on Windows");
+}
+
+ClientArena::~ClientArena() = default;
+
+SessionArena* SessionArena::adopt(bufs::Fd, uint64_t, const std::shared_ptr<ArenaAccount>&, const char*& why) {
+    why = "shared areas are not available on Windows";
+    return nullptr;
+}
+
+SessionArena::~SessionArena() = default;
+
+} // namespace rpc::detail
+
+#else
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -97,3 +120,5 @@ SessionArena::~SessionArena() {
 }
 
 } // namespace rpc::detail
+
+#endif

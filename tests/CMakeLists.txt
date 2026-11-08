@@ -1,10 +1,20 @@
 set(examples ${CMAKE_CURRENT_SOURCE_DIR}/../examples)
 
-add_executable(rpc_test_rpc test_rpc.cpp)
-rpc_generate(rpc_test_rpc SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SOURCE_DIR}/kitchen.bufs)
-target_include_directories(rpc_test_rpc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-add_test(NAME rpc_integration COMMAND rpc_test_rpc $<TARGET_FILE:rpc_interop_server>)
-set_tests_properties(rpc_integration PROPERTIES TIMEOUT 180)
+if(WIN32)
+    # test_rpc.cpp is POSIX throughout (posix_spawn, memfds, the rings). The local transport here is a stream on an AF_UNIX
+    # socket, which has its own test against the same Calc service.
+    add_executable(rpc_test_local_windows test_local_windows.cpp)
+    rpc_generate(rpc_test_local_windows SCHEMAS ${examples}/calc.bufs)
+    target_include_directories(rpc_test_local_windows PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    add_test(NAME rpc_local_windows COMMAND rpc_test_local_windows)
+    set_tests_properties(rpc_local_windows PROPERTIES TIMEOUT 120)
+else()
+    add_executable(rpc_test_rpc test_rpc.cpp)
+    rpc_generate(rpc_test_rpc SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SOURCE_DIR}/kitchen.bufs)
+    target_include_directories(rpc_test_rpc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    add_test(NAME rpc_integration COMMAND rpc_test_rpc $<TARGET_FILE:rpc_interop_server>)
+    set_tests_properties(rpc_integration PROPERTIES TIMEOUT 180)
+endif()
 
 # The server the TypeScript tests talk to, and the tests themselves (ts/tests).
 add_executable(rpc_interop_server interop_server.cpp)
@@ -45,7 +55,7 @@ set_tests_properties(rpc_rcc_rejects_unknown_type PROPERTIES
 
 # A warm server and client allocate nothing per call.
 # It replaces operator new to count, which cannot link under ThreadSanitizer (its runtime defines operator new itself).
-if(NOT CMAKE_CXX_FLAGS MATCHES "sanitize=thread")
+if(NOT WIN32 AND NOT CMAKE_CXX_FLAGS MATCHES "sanitize=thread")
     add_executable(rpc_test_alloc test_alloc.cpp)
     rpc_generate(rpc_test_alloc SCHEMAS ${examples}/calc.bufs ${CMAKE_CURRENT_SOURCE_DIR}/kitchen.bufs)
     target_include_directories(rpc_test_alloc PRIVATE ${examples} ${CMAKE_CURRENT_SOURCE_DIR})
