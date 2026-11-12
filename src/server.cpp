@@ -708,12 +708,18 @@ private:
             return fail(1002, "call id 0");
         if (!blobsAllowed(env))
             return;
+        // fail() closes the link, and closing takes mu_ again: decide under the lock, act after it.
+        bool duplicate = false;
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (const CallRef& call : calls_)
-                if (call->id == id)
-                    return fail(1002, "duplicate call id");
+                if (call->id == id) {
+                    duplicate = true;
+                    break;
+                }
         }
+        if (duplicate)
+            return fail(1002, "duplicate call id");
         ep_.calls.fetch_add(1, std::memory_order_relaxed);
         const auto reject = [&](Code code, std::string message) {
             ep_.rejected.fetch_add(1, std::memory_order_relaxed);

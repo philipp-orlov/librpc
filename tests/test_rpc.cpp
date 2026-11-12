@@ -1790,6 +1790,53 @@ void runAll() {
     testBlobsRoundTrip();
 }
 
+
+// A second Call with the id of one still running closes the connection with 1002. The close happens
+// outside the session lock: closing re-enters it, and doing both on the reader thread hangs the session.
+void testDuplicateCallId() {
+    std::puts("duplicate call id closes the link instead of deadlocking");
+    const bool before = g_local;
+    g_local = false;
+    {
+        TestServer server;
+        http::WebSocketClient ws;
+        http::WebSocketClientOptions options;
+        options.subprotocols = {rpc::detail::kSubprotocol};
+        ws.connect("ws://127.0.0.1:" + std::to_string(server.port()) + "/rpc", options);
+        const auto hello = rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+            e.setKind(rpc::wire::Kind::Hello);
+            e.setProtocol(rpc::detail::kProtocol);
+        });
+        ws.sendBinary(hello.first, hello.second);
+        CHECK(ws.receive(std::chrono::steady_clock::now() + 3s, 15000ms).has_value());
+        bufs::MessageBuilder builder;
+        builder.initRoot<CalcSleepRequest>().setMillis(5000);
+        const auto sealed = builder.finish();
+        const auto env = rpc::detail::envelope([&](rpc::wire::Envelope::Builder& e) {
+            e.setId(7);
+            e.setKind(rpc::wire::Kind::Call);
+            e.setMethod(CalcMethods::Sleep);
+        });
+        std::vector<uint8_t> frame(env.second + sealed.second);
+        std::memcpy(frame.data(), env.first, env.second);
+        std::memcpy(frame.data() + env.second, sealed.first, sealed.second);
+        ws.sendBinary(frame.data(), frame.size());
+        ws.sendBinary(frame.data(), frame.size());  // the same id again, while the first is in flight
+        bool closed = false;
+        try {
+            for (int i = 0; i < 10; ++i)
+                ws.receive(std::chrono::steady_clock::now() + 2s, 15000ms);
+        } catch (const http::WebSocketError& error) {
+            closed = error.kind() == http::WebSocketError::Kind::Closed && error.closeCode() == 1002;
+        }
+        CHECK(closed);
+        // The server still serves a new session.
+        CalcClient calc(server.connect());
+        CHECK(calc.Add(2, 3) == 5);
+    }
+    g_local = before;
+}
+
 int main(int argc, char** argv) {
     if (argc > 2 && std::strcmp(argv[1], "--blob-child") == 0)
         return blobChild(argv[2]);
@@ -1812,6 +1859,7 @@ int main(int argc, char** argv) {
     testBlobsValidation();
     testBlobsHandshake();
     testBlobsRegistration();
+    testDuplicateCallId();
     testBlobsDeadClient(argv[0]);
     if (argc > 1)
         testOtherProcess(argv[1]);
