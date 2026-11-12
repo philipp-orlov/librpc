@@ -742,12 +742,17 @@ private:
         call->request = frame.bodyData;
         call->requestSize = frame.bodySize;
         call->frame = std::move(frameBuffer);
+        // Decide under the lock, reject after it: rejecting sends, a send can close the connection, and
+        // closing calls onClosed(), which takes mu_ again.
+        bool full;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            if (calls_.size() >= ep_.options.maxInflight_)
-                return reject(Code::ResourceExhausted, "too many calls in flight on this session");
-            calls_.push_back(call);
+            full = calls_.size() >= ep_.options.maxInflight_;
+            if (!full)
+                calls_.push_back(call);
         }
+        if (full)
+            return reject(Code::ResourceExhausted, "too many calls in flight on this session");
         {
             std::lock_guard<std::mutex> lock(ep_.mutex);
             ++ep_.inflight;
@@ -1197,7 +1202,9 @@ private:
     size_t window_ = 1 << 20;
 
     std::atomic<bool> closed_{false};
-    mutable std::mutex mu_;  // calls_, pending_, running_, unacked_, goodbye_, state_
+    // calls_, pending_, running_, unacked_, goodbye_, state_. Rule: never send on or close link_ while
+    // holding mu_ (a send may close the connection, and closing re-enters onClosed(), which locks mu_).
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     std::vector<CallRef> calls_;    // at most maxInflight; searched linearly
     std::vector<CallRef> pending_;  // serial sessions: calls waiting for the running one
